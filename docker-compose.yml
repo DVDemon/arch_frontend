@@ -1,0 +1,449 @@
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: fdm-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: fdm_db
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./beeatlas-fdm-infrastructure/init-schemas.sql:/docker-entrypoint-initdb.d/init-schemas.sql
+    ports:
+      - "5433:5432"
+    networks:
+      - fdm-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: fdm-rabbitmq
+    restart: unless-stopped
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+      - ./beeatlas-fdm-infrastructure/rabbitmq/definitions.json:/etc/rabbitmq/definitions.json
+      - ./beeatlas-fdm-infrastructure/rabbitmq/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf
+    networks:
+      - fdm-network
+
+    healthcheck:
+      test: [ "CMD", "rabbitmq-diagnostics", "ping" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    restart: unless-stopped
+    command: [ "redis-server", "--save", "", "--appendonly", "no" ]
+    networks:
+      - fdm-network
+    profiles:
+      - ${AUTHENTIC_AUTH:-false}
+
+  authentik-postgres:
+    image: postgres:15-alpine
+    container_name: authentik-postgres
+    networks:
+      - fdm-network
+    ports:
+      - "5434:5432"
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: authentik
+      POSTGRES_PASSWORD: authentik
+      POSTGRES_DB: authentik_db
+    profiles:
+      - ${AUTHENTIC_AUTH:-false}
+    volumes:
+      - authentik-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U authentik -d authentik_db" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  authentik-server:
+    image: ghcr.io/goauthentik/server:2025.10.2
+    container_name: authentik-server
+    command: server
+    restart: unless-stopped
+    environment:
+      AUTHENTIK_POSTGRESQL__HOST: authentik-postgres
+      AUTHENTIK_POSTGRESQL__PORT: 5432
+      AUTHENTIK_POSTGRESQL__NAME: authentik_db
+      AUTHENTIK_POSTGRESQL__USER: authentik
+      AUTHENTIK_POSTGRESQL__PASSWORD: authentik
+      AUTHENTIK_REDIS__HOST: redis
+      AUTHENTIK_SECRET_KEY: my-strong-secret-key
+    ports:
+      - "5000:9000"
+      - "5443:9443"
+    volumes:
+      - authentik-media:/media
+      - authentik-templates:/templates
+    depends_on:
+      authentik-postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    networks:
+      - fdm-network
+    profiles:
+      - ${AUTHENTIC_AUTH:-false}
+
+  authentik-worker:
+    image: ghcr.io/goauthentik/server:2025.10.2
+    container_name: authentik-worker
+    command: worker
+    restart: unless-stopped
+    user: root
+    environment:
+      AUTHENTIK_POSTGRESQL__HOST: authentik-postgres
+      AUTHENTIK_POSTGRESQL__PORT: 5432
+      AUTHENTIK_POSTGRESQL__NAME: authentik_db
+      AUTHENTIK_POSTGRESQL__USER: authentik
+      AUTHENTIK_POSTGRESQL__PASSWORD: authentik
+      AUTHENTIK_REDIS__HOST: redis
+      AUTHENTIK_SECRET_KEY: my-strong-secret-key
+    volumes:
+      - authentik-media:/media
+      - authentik-templates:/templates
+      - authentik-certs:/certs
+    depends_on:
+      authentik-postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    networks:
+      - fdm-network
+    profiles:
+      - ${AUTHENTIC_AUTH:-false}
+
+  neo4j:
+    image: neo4j:5-community
+    container_name: neo4j
+    environment:
+      - NEO4J_AUTH=neo4j/password
+      - NEO4J_PLUGINS=["apoc"]
+      - NEO4J_dbms_security_procedures_unrestricted=apoc.*
+      - NEO4J_dbms_security_procedures_allowlist=apoc.*
+    ports:
+      - "7474:7474"  # HTTP - Neo4j Browser
+      - "7687:7687"  # Bolt protocol
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+      - neo4j_import:/var/lib/neo4j/import
+      - neo4j_plugins:/plugins
+    networks:
+      - fdm-network
+    healthcheck:
+      test: [ "CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:7474" ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+
+  gateway:
+    build:
+      context: ./beeatlas-fdm-infrastructure/services/gateway
+      dockerfile: Dockerfile
+    container_name: gateway
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+      - "8090:8090"
+      - "10260:10260"
+    environment:
+      JWKS: "jwks"
+      SPRING_PROFILES_ACTIVE: local
+      AUTHENTIK_HOST: http://authentik-server:9000
+      AUTHENTIK_SECRET_KEY: my-strong-secret-key
+      INTEGRATION_AUTH_SERVER_URL: http://fdm-auth-backend:8080
+      INTEGRATION_AUTHENTIC_AUTH_URL: http://authentik-server:9000/application/o/test/
+      INTEGRATION_TECHRADAR_SERVER_URL: http://techradar-backend:8080
+      INTEGRATION_CAPABILITY_SERVER_URL: http://capability-backend:8080
+      INTEGRATION_PRODUCTS_SERVER_URL: http://products-service:8080
+      INTEGRATION_GRAPH_SERVER_URL: http://architect-graph-service:8080
+      INTEGRATION_CX_SERVER_URL: "http://cxserverurl"
+      INTEGRATION_PACK_LOADER_SERVER_URL: "http://packloaderserver"
+      INTEGRATION_DASHBOARD_SERVER_URL: "http://dashboardserver"
+      INTEGRATION_NOTIFICATION_SERVER_URL: "http://notificationserver"
+      INTEGRATION_DOCUMENT_SERVER_URL: "http://documentserverurl"
+      INTEGRATION_CAMUNDA_SERVER_URL: "http://camundaserverurl"
+      INTEGRATION_ARCH_SERVER_URL: "http://archserverurl"
+      INTEGRATION_GRAPH_VALIDATOR_SERVER_URL: "http://graphvalidatorserverurl"
+      INTEGRATION_ARCHITECTURE_SERVER_URL: "http://architectureserverurl"
+      INTEGRATION_AMBASSADOR_SERVER_URL: "http://stagemapicserverurl"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://opentelemetry"
+      INTEGRATION_OBS_DASHBOARD_SERVER_URL: "http://obsdashboardurl"
+      INTEGRATION_SEQUENCE_BACKEND_SERVER_URL: "http://sequencebackendurl"
+      DEMO_AUTH: true
+    networks:
+      - fdm-network
+
+
+  fdm-auth-backend:
+    build:
+      context: ./beeatlas-fdm-infrastructure/services/fdm-auth-service
+      dockerfile: Dockerfile
+    container_name: fdm-auth-backend
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/fdm_db
+      SPRING_DATASOURCE_USERNAME: postgres
+      SPRING_DATASOURCE_PASSWORD: postgres
+      SPRING_JPA_HIBERNATE_DDL_AUTO: none
+      SPRING_JPA_PROPERTIES_HIBERNATE_DEFAULT_SCHEMA: user_auth
+      SPRING_FLYWAY_DEFAULT_SCHEMA: user_auth
+      SPRING_FLYWAY_BASELINE_ON_MIGRATE: "true"
+      SPRING_FLYWAY_CLEAN_DISABLED: "true"
+      INTEGRATION_PRODUCTS_SERVER_URL: http://products-service:8080
+      GWURL: http://gateway:8080
+      AUTHBASIC: "Basic xxxxxxxx" # заменить на реальные креды
+      TECHUSER: "tech-user" # заменить на логин техпользователя
+      TECHPASSWORD: "tech-password" # заменить на пароль техпользователя
+      OTEL_EXPORTER_OTLP_ENDPOINT:  # заменить на URL OTEL
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8080/actuator/health" ]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "${FDM_AUTH_SERVICE_PORT:-8081}:8080"
+    networks:
+      - fdm-network
+    restart: unless-stopped
+
+  capability-backend:
+    build:
+      context: ./beeatlas-fdm-infrastructure/services/capability-service
+      dockerfile: Dockerfile
+    container_name: capability-backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      SPRING_RABBITMQ_VIRTUAL_HOST: /
+      SPRING_RABBITMQ_TEMPLATE_EXCHANGE: capability.exchange
+      SPRING_RABBITMQ_TEMPLATE_ROUTING_KEY: capability.routing
+      SPRING_RABBITMQ_HOST: fdm-rabbitmq
+      SPRING_RABBITMQ_PORT: 5672
+      SPRING_RABBITMQ_USERNAME: guest
+      SPRING_RABBITMQ_PASSWORD: guest
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/fdm_db
+      SPRING_DATASOURCE_USERNAME: postgres
+      SPRING_DATASOURCE_PASSWORD: postgres
+      SPRING_JPA_HIBERNATE_DDL_AUTO: none
+      SPRING_JPA_PROPERTIES_HIBERNATE_DEFAULT_SCHEMA: capability
+      SPRING_FLYWAY_DEFAULT_SCHEMA: capability
+      SPRING_FLYWAY_BASELINE_ON_MIGRATE: "true"
+      SPRING_FLYWAY_CLEAN_DISABLED: "true"
+      INTEGRATION_NOTIFICATION_SERVER_URL: "http://notification-service" # добавить адрес
+      INTEGRATION_DOCUMENT_SERVER_URL: "http://document-service"
+      INTEGRATION_PRODUCT_SERVER_URL: http://products-service/:8080
+      INTEGRATION_BPM_SERVER_URL: "http://bpm-service"
+      INTEGRATION_PACK_LOADER_SERVER_URL: "http://pack-loader-service"
+      INTEGRATION_DASHBOARD_SERVER_URL: "http://dashboard-service"
+      INTEGRATION_AUTH_SERVER_URL: http://fdm-auth-backend:8080
+      INTEGRATION_AI_TOOL_SERVER_URL: "http://ai-tool-service"
+      INTEGRATION_AUTHSSO_SERVER_URL: "http://auth-service"
+      timeout: 3s
+      retries: 15
+    ports:
+      - "${CAPABILITY_SERVICE_PORT:-8082}:8080"
+    networks:
+      - fdm-network
+    restart: unless-stopped
+
+  architect-graph-service:
+    build:
+      context: ./beeatlas-fdm-infrastructure/services/architect-graph-service
+      dockerfile: Dockerfile
+    container_name: architect-graph-service
+    depends_on:
+      postgres:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      SPRING_NEO4J_URI: bolt://neo4j:7687
+      SPRING_NEO4J_AUTHENTICATION_USERNAME: neo4j
+      SPRING_NEO4J_AUTHENTICATION_PASSWORD: password
+      JAVA_OPTS: -Xmx512m -Xms256m
+      SPRING_SERVICES_DOCUMENTS_URL: "http://document-service"
+      SPRING_RABBITMQ_VIRTUAL_HOST: /
+      SPRING_RABBITMQ_TEMPLATE_EXCHANGE: ${RABBITMQ_EXCHANGE:-capability.exchange}
+      SPRING_RABBITMQ_TEMPLATE_ROUTING_KEY: ${RABBITMQ_ROUTING_KEY:-capability.routing}
+      SPRING_RABBITMQ_HOST: fdm-rabbitmq
+      SPRING_RABBITMQ_PORT: 5672
+      SPRING_RABBITMQ_USERNAME: guest
+      SPRING_RABBITMQ_PASSWORD: guest
+      SPRING_REDIS_HOST: "redis"
+      SPRING_REDIS_PORT: "6379"
+      SPRING_REDIS_PASSWORD: "redis-password"
+      INTEGRATION_AUTHSSO_SERVER_URL: "ambassador-auth-sso"
+      INTEGRATION_PRODUCT_SERVER_URL: http://products-service:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: "opentelemetry"
+    ports:
+      - "8083:8080"
+    networks:
+      - fdm-network
+    restart: unless-stopped
+
+  products-service:
+    build:
+      context: ./beeatlas-fdm-infrastructure/services/products-service
+      dockerfile: Dockerfile
+    container_name: products-service
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      SPRING_RABBITMQ_VIRTUAL_HOST: /
+      SPRING_RABBITMQ_TEMPLATE_EXCHANGE: capability.exchange
+      SPRING_RABBITMQ_TEMPLATE_ROUTING_KEY: capability.routing
+      SPRING_RABBITMQ_HOST: fdm-rabbitmq
+      SPRING_RABBITMQ_PORT: 5672
+      SPRING_RABBITMQ_USERNAME: guest
+      SPRING_RABBITMQ_PASSWORD: guest
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/fdm_db
+      SPRING_DATASOURCE_USERNAME: postgres
+      SPRING_DATASOURCE_PASSWORD: postgres
+      SPRING_JPA_HIBERNATE_DDL_AUTO: none
+      SPRING_JPA_PROPERTIES_HIBERNATE_DEFAULT_SCHEMA: product
+      SPRING_FLYWAY_DEFAULT_SCHEMA: product
+      SPRING_FLYWAY_BASELINE_ON_MIGRATE: "true"
+      SPRING_FLYWAY_CLEAN_DISABLED: "true"
+      INTEGRATION_CAPABILITY_SERVER_URL: "http://capability-service"
+      INTEGRATION_DASHBOARD_SCENARIOS_SERVER_URL: "http://dashboard-service"
+      INTEGRATION_AUTH_SERVER_URL: http://fdm-auth-backend:8080
+      INTEGRATION_AUTHSSO_SERVER_URL: "http://auth-service"
+      INTEGRATION_TECHRADAR_SERVER_URL: "http://techradar-service"
+      INTEGRATION_GRAPH_SERVER_URL: "http://graph-service"
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8080/actuator/health" ]
+      interval: 15s
+      timeout: 3s
+      retries: 15
+      start_period: 180s
+    ports:
+      - "8084:8080"
+    networks:
+      - fdm-network
+    restart: unless-stopped
+
+  techradar-backend:
+    build:
+      context: ./beeatlas-fdm-infrastructure/services/techradar-service
+      dockerfile: Dockerfile
+    container_name: techradar-backend
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/fdm_db
+      SPRING_DATASOURCE_USERNAME: postgres
+      SPRING_DATASOURCE_PASSWORD: postgres
+      SPRING_JPA_HIBERNATE_DDL_AUTO: none
+      SPRING_JPA_PROPERTIES_HIBERNATE_DEFAULT_SCHEMA: techradar
+      SPRING_FLYWAY_DEFAULT_SCHEMA: techradar
+      SPRING_FLYWAY_BASELINE_ON_MIGRATE: "true"
+      SPRING_FLYWAY_CLEAN_DISABLED: "true"
+      INTEGRATION_NOTIFICATION_SERVER_URL: "http://notification-service"
+      INTEGRATION_DOCUMENT_SERVER_URL: "https://document-service"
+      INTEGRATION_PRODUCTS_SERVER_URL: http://products-service:8080
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8080/actuator/health" ]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+      start_period: 180s
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8085:8080"
+    networks:
+      - fdm-network
+    restart: unless-stopped
+
+  structurizr-onpremises:
+    image: structurizr/onpremises:latest
+    container_name: structurizr-onpremises
+    restart: unless-stopped
+    ports:
+      - "8087:8080"
+    volumes:
+      - structurizr-data:/usr/local/structurizr
+    networks:
+      - fdm-network
+
+  structurizr_backend:
+    tty: true
+    container_name: structurizr_backend
+    build:
+      context: ./beeatlas-fdm-infrastructure/services/structurizr_backend
+      dockerfile: Dockerfile
+    volumes:
+      - ./beeatlas-fdm-infrastructure/services/structurizr_backend:/opt/structurizr_backend
+    ports:
+      - "8086:8080"
+    environment:
+      - URL_ONPREMISES_WORKSPACE=http://structurizr-onpremises:8080/api/workspace
+      - URL_ONPREMISES_BASE=http://structurizr-onpremises:8080/api
+      - URL_DOCUMENTS=http://document-service:8080
+      - URL_TECHRADAR=http://techradar-backend:8080
+      - URL_PRODUCTS=http://products-service:8080
+      - URL_VEGA=https://vega.vimpelcom.ru
+      - ONPREMISES_PASSWORD=1234567890
+    depends_on:
+      - structurizr-onpremises
+    networks:
+      - fdm-network
+
+  beeatlas-frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: beeatlas-frontend
+    restart: unless-stopped
+    ports:
+      - "${BEEATLAS_FRONTEND_PORT:-3000}:3000"
+    environment:
+      # URL Gateway для серверных запросов (из контейнера — по имени сервиса)
+      API_URL: http://gateway:8080
+      # URL для браузера (через порт хоста)
+      NEXT_PUBLIC_API_URL: http://localhost:8080
+    networks:
+      - fdm-network
+      
+networks:
+  fdm-network:
+    driver: bridge
+
+volumes:
+  postgres-data:
+  rabbitmq-data:
+  authentik-media:
+  authentik-templates:
+  authentik-certs:
+  neo4j_data:
+  neo4j_logs:
+  neo4j_import:
+  neo4j_plugins:
+  authentik-postgres-data:
+  structurizr-data:
