@@ -1,0 +1,3 @@
+[submodule "beeatlas-fdm-infrastructure"]
+	path = beeatlas-fdm-infrastructure
+	url = https://github.com/tech-beeline/beeatlas-fdm-infrastructure
