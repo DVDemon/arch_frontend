@@ -8,7 +8,10 @@ BeeAtlas Lite — это Next.js приложение, которое подкл
 
 - управлять продуктами, возможностями и технологическим радаром;
 - загружать архитектурные workspace (Structurizr JSON) в локальный и глобальный граф;
-- строить контекстные диаграммы и выполнять CYPHER-запросы к Neo4j.
+- строить контекстные диаграммы и выполнять CYPHER-запросы к Neo4j;
+- загружать `workspace.dsl` (Structurizr DSL) в FDM: импорт контейнеров, проверки архитектуры (fitness functions) и технических возможностей;
+- просматривать результаты проверок архитектуры (последняя оценка по продукту);
+- просматривать технические возможности продукта из контейнеров и интерфейсов.
 
 ## Структура сервисов (docker-compose)
 
@@ -139,7 +142,7 @@ npm run dev
 |---------|----------|
 | `/` | Главная — навигация по разделам |
 | `/products` | Каталог продуктов (CRUD, фильтр, сортировка) |
-| `/products/[alias]` | Карточка продукта: информация, технологии, пользователи, контейнеры, fitness-функции, контекстные диаграммы, техвозможности |
+| `/products/[alias]` | Карточка продукта с вкладками: **Информация** (редактирование, Structurizr, загрузка `workspace.dsl`), **Технологии**, **Пользователи**, **Контейнеры**, **Проверки архитектуры** (fitness, HTML-результаты), **Context** (диаграммы), **Технические возможности** (из контейнеров/интерфейсов) |
 | `/capabilities` | Каталог возможностей: дерево бизнес/техвозможностей, поиск, детали |
 | `/tech-radar` | Технологический радар: визуализация по кольцам и секторам |
 | `/tech-radar/edit` | Редактирование технологий: CRUD, версии, статусы |
@@ -157,11 +160,18 @@ npm run dev
 | GET | `/user/product/admin` | Список продуктов (админ) |
 | GET | `/product/{alias}` | Продукт по alias |
 | PUT | `/product` | Обновление продукта |
+| PATCH | `/product/{alias}/workspace` | Обновление Structurizr (URL, Key, Secret, Workspace) |
 | DELETE | `/product/{alias}` | Удаление продукта |
 | GET | `/product/{alias}/employee` | Пользователи продукта |
-| GET | `/product/{alias}/container` | Контейнеры с интерфейсами |
-| GET | `/product/{alias}/fitness-function` | Fitness-функции |
+| GET | `/product/{alias}/container` | Контейнеры с интерфейсами и операциями (включая TC) |
+| GET | `/product/{alias}/fitness-function` | Результаты проверок архитектуры (последняя оценка; опционально `source_type`, `source_id`). Поле `resultDetails` — HTML |
 | GET | `/product/implemented/container/tech-capability` | Техвозможности по контейнерам |
+
+#### Structurizr Backend (`/structurizr-backend`)
+
+| Метод | Путь | Описание |
+|-------|------|----------|
+| POST | `/api/v1/dsl2fdm` | Импорт `workspace.dsl` в FDM: проверки, контейнеры, TC (тело: `{ productAlias, workspace: base64 }`) |
 
 #### Capabilities (`/api-gateway/capability/v1`)
 
