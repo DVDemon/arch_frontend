@@ -8,8 +8,9 @@ import {
   getProductContainers,
   getProductUsers,
   getProductFitnessFunctions,
-  getProductTechCapabilities,
   updateProduct,
+  uploadWorkspaceDsl,
+  patchProductWorkspace,
 } from "@/lib/products-api";
 import type { ProductTechCapability } from "@/lib/products-api";
 import { getTechList } from "@/lib/techradar-api";
@@ -110,11 +111,13 @@ function EditableField({
   value,
   onSave,
   multiline,
+  isSecret,
 }: {
   label: string;
   value: string;
   onSave: (v: string) => Promise<void>;
   multiline?: boolean;
+  isSecret?: boolean;
 }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(value);
@@ -152,13 +155,14 @@ function EditableField({
   }, [draft, value, onSave]);
 
   if (!editing) {
+    const displayValue = isSecret && value ? "••••••••" : value || "—";
     return (
       <div className="flex items-center gap-4 border-b border-zinc-200 py-2 dark:border-zinc-700">
         <span className="w-48 shrink-0 font-medium text-zinc-600 dark:text-zinc-400">
           {label}
         </span>
         <span className="min-w-0 flex-1 break-all text-zinc-900 dark:text-zinc-100">
-          {value || "—"}
+          {displayValue}
         </span>
         <button
           type="button"
@@ -185,9 +189,10 @@ function EditableField({
         />
       ) : (
         <input
-          type="text"
+          type={isSecret ? "password" : "text"}
           value={draft}
           onChange={(e) => setDraft(e.target.value)}
+          placeholder={isSecret && !value ? "Введите значение" : undefined}
           className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-zinc-900 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100"
         />
       )}
@@ -216,12 +221,354 @@ function EditableField({
   );
 }
 
+function StructurizrFieldsBlock({
+  product,
+  onSave,
+}: {
+  product: ProductFull;
+  onSave: (payload: {
+    structurizrApiUrl?: string;
+    structurizrApiKey?: string;
+    structurizrApiSecret?: string;
+    structurizrWorkspaceName?: string;
+  }) => Promise<void>;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState({
+    structurizrApiUrl: product.structurizrApiUrl ?? "",
+    structurizrApiKey: product.structurizrApiKey ?? "",
+    structurizrApiSecret: product.structurizrApiSecret ?? "",
+    structurizrWorkspaceName: product.structurizrWorkspaceName ?? "",
+  });
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const handleStart = useCallback(() => {
+    setDraft({
+      structurizrApiUrl: product.structurizrApiUrl ?? "",
+      structurizrApiKey: product.structurizrApiKey ?? "",
+      structurizrApiSecret: product.structurizrApiSecret ?? "",
+      structurizrWorkspaceName: product.structurizrWorkspaceName ?? "",
+    });
+    setErr(null);
+    setEditing(true);
+  }, [product]);
+
+  const handleCancel = useCallback(() => {
+    setEditing(false);
+    setErr(null);
+  }, []);
+
+  const handleSave = useCallback(async () => {
+    const payload = {
+      structurizrApiUrl: draft.structurizrApiUrl.trim() || undefined,
+      structurizrApiKey: draft.structurizrApiKey.trim() || undefined,
+      structurizrApiSecret: draft.structurizrApiSecret.trim() || undefined,
+      structurizrWorkspaceName: draft.structurizrWorkspaceName.trim() || undefined,
+    };
+    if (
+      !payload.structurizrApiUrl ||
+      !payload.structurizrApiKey ||
+      !payload.structurizrApiSecret ||
+      !payload.structurizrWorkspaceName
+    ) {
+      setErr("Все поля Structurizr обязательны для заполнения");
+      return;
+    }
+    setSaving(true);
+    setErr(null);
+    try {
+      await onSave(payload);
+      setEditing(false);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Ошибка сохранения");
+    } finally {
+      setSaving(false);
+    }
+  }, [draft, onSave]);
+
+  const inputClass =
+    "w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-zinc-900 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100";
+
+  if (!editing) {
+    const hasAny =
+      product.structurizrApiUrl ||
+      product.structurizrApiKey ||
+      product.structurizrApiSecret ||
+      product.structurizrWorkspaceName;
+    return (
+      <div className="space-y-2 rounded-lg border border-zinc-200 bg-zinc-50/50 p-4 dark:border-zinc-700 dark:bg-zinc-800/30">
+        <div className="flex items-center justify-between">
+          <span className="font-medium text-zinc-700 dark:text-zinc-300">
+            Structurizr
+          </span>
+          <button
+            type="button"
+            onClick={handleStart}
+            className="rounded px-2 py-1 text-sm text-amber-600 hover:bg-amber-50 dark:text-amber-400 dark:hover:bg-amber-950/30"
+          >
+            Изменить
+          </button>
+        </div>
+        {hasAny ? (
+          <div className="space-y-1 text-sm">
+            <div className="flex gap-4">
+              <span className="w-40 shrink-0 text-zinc-500 dark:text-zinc-400">
+                API URL
+              </span>
+              <span className="break-all text-zinc-900 dark:text-zinc-100">
+                {product.structurizrApiUrl || "—"}
+              </span>
+            </div>
+            <div className="flex gap-4">
+              <span className="w-40 shrink-0 text-zinc-500 dark:text-zinc-400">
+                API Key
+              </span>
+              <span className="text-zinc-900 dark:text-zinc-100">
+                {product.structurizrApiKey ? "••••••••" : "—"}
+              </span>
+            </div>
+            <div className="flex gap-4">
+              <span className="w-40 shrink-0 text-zinc-500 dark:text-zinc-400">
+                API Secret
+              </span>
+              <span className="text-zinc-900 dark:text-zinc-100">
+                {product.structurizrApiSecret ? "••••••••" : "—"}
+              </span>
+            </div>
+            <div className="flex gap-4">
+              <span className="w-40 shrink-0 text-zinc-500 dark:text-zinc-400">
+                Workspace
+              </span>
+              <span className="text-zinc-900 dark:text-zinc-100">
+                {product.structurizrWorkspaceName || "—"}
+              </span>
+            </div>
+          </div>
+        ) : (
+          <p className="text-sm text-zinc-500 dark:text-zinc-400">
+            Не задано. Нажмите «Изменить» для настройки.
+          </p>
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-3 rounded-lg border border-zinc-200 bg-zinc-50/50 p-4 dark:border-zinc-700 dark:bg-zinc-800/30">
+      <div className="font-medium text-zinc-700 dark:text-zinc-300">
+        Structurizr
+      </div>
+      <div className="space-y-2">
+        <div>
+          <label className="mb-1 block text-sm text-zinc-600 dark:text-zinc-400">
+            API URL
+          </label>
+          <input
+            type="text"
+            value={draft.structurizrApiUrl}
+            onChange={(e) =>
+              setDraft((d) => ({ ...d, structurizrApiUrl: e.target.value }))
+            }
+            className={inputClass}
+            placeholder="https://..."
+          />
+        </div>
+        <div>
+          <label className="mb-1 block text-sm text-zinc-600 dark:text-zinc-400">
+            API Key
+          </label>
+          <input
+            type="password"
+            value={draft.structurizrApiKey}
+            onChange={(e) =>
+              setDraft((d) => ({ ...d, structurizrApiKey: e.target.value }))
+            }
+            className={inputClass}
+            placeholder="Введите API Key"
+          />
+        </div>
+        <div>
+          <label className="mb-1 block text-sm text-zinc-600 dark:text-zinc-400">
+            API Secret
+          </label>
+          <input
+            type="password"
+            value={draft.structurizrApiSecret}
+            onChange={(e) =>
+              setDraft((d) => ({ ...d, structurizrApiSecret: e.target.value }))
+            }
+            className={inputClass}
+            placeholder="Введите API Secret"
+          />
+        </div>
+        <div>
+          <label className="mb-1 block text-sm text-zinc-600 dark:text-zinc-400">
+            Workspace Name
+          </label>
+          <input
+            type="text"
+            value={draft.structurizrWorkspaceName}
+            onChange={(e) =>
+              setDraft((d) => ({
+                ...d,
+                structurizrWorkspaceName: e.target.value,
+              }))
+            }
+            className={inputClass}
+            placeholder="Имя workspace"
+          />
+        </div>
+      </div>
+      {err && (
+        <p className="text-sm text-red-600 dark:text-red-400">{err}</p>
+      )}
+      <div className="flex gap-2">
+        <button
+          type="button"
+          onClick={handleSave}
+          disabled={saving}
+          className="rounded-lg bg-amber-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-amber-700 disabled:opacity-50"
+        >
+          {saving ? "Сохранение…" : "Сохранить"}
+        </button>
+        <button
+          type="button"
+          onClick={handleCancel}
+          disabled={saving}
+          className="rounded-lg border border-zinc-300 px-3 py-1.5 text-sm font-medium text-zinc-700 hover:bg-zinc-100 dark:border-zinc-600 dark:text-zinc-300 dark:hover:bg-zinc-800 disabled:opacity-50"
+        >
+          Отмена
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function DslUploadBlock({
+  productAlias,
+  onSuccess,
+}: {
+  productAlias: string;
+  onSuccess: () => void;
+}) {
+  const [uploading, setUploading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [successPopup, setSuccessPopup] = useState(false);
+
+  const handleFileChange = useCallback(
+    async (e: React.ChangeEvent<HTMLInputElement>) => {
+      const file = e.target.files?.[0];
+      if (!file) return;
+      setError(null);
+      setSuccessPopup(false);
+      setUploading(true);
+      try {
+        const text = await file.text();
+        await uploadWorkspaceDsl(productAlias, text);
+        onSuccess();
+        setSuccessPopup(true);
+      } catch (e) {
+        const msg =
+          e instanceof Error ? e.message : "Ошибка загрузки workspace.dsl";
+        setError(msg);
+      } finally {
+        setUploading(false);
+        e.target.value = "";
+      }
+    },
+    [productAlias, onSuccess]
+  );
+
+  return (
+    <div className="space-y-2 rounded-lg border border-zinc-200 bg-zinc-50 p-4 dark:border-zinc-700 dark:bg-zinc-800/50">
+      <div className="font-medium text-zinc-700 dark:text-zinc-300">
+        Загрузка workspace.dsl
+      </div>
+      <p className="text-sm text-zinc-600 dark:text-zinc-400">
+        Загрузите файл workspace.dsl для импорта в FDM. Операция может занять
+        несколько минут.
+      </p>
+      <div className="flex flex-wrap items-center gap-3">
+        <input
+          type="file"
+          accept=".dsl"
+          onChange={handleFileChange}
+          disabled={uploading}
+          className="block w-full max-w-xs text-sm text-zinc-600 file:mr-3 file:rounded-lg file:border-0 file:bg-amber-100 file:px-4 file:py-2 file:text-amber-800 file:hover:bg-amber-200 dark:text-zinc-400 dark:file:bg-amber-900/40 dark:file:text-amber-200 dark:file:hover:bg-amber-900/60"
+        />
+        {uploading && (
+          <div className="flex items-center gap-2 text-amber-600 dark:text-amber-400">
+            <svg
+              className="h-5 w-5 animate-spin"
+              xmlns="http://www.w3.org/2000/svg"
+              fill="none"
+              viewBox="0 0 24 24"
+              aria-hidden="true"
+            >
+              <circle
+                className="opacity-25"
+                cx="12"
+                cy="12"
+                r="10"
+                stroke="currentColor"
+                strokeWidth="4"
+              />
+              <path
+                className="opacity-75"
+                fill="currentColor"
+                d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
+              />
+            </svg>
+            <span>Обработка…</span>
+          </div>
+        )}
+      </div>
+      {error && (
+        <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700 dark:border-red-800 dark:bg-red-900/20 dark:text-red-300">
+          {error}
+        </div>
+      )}
+      {successPopup && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
+          onClick={() => setSuccessPopup(false)}
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="success-title"
+        >
+          <div
+            className="max-w-sm rounded-xl border border-zinc-200 bg-white p-6 shadow-xl dark:border-zinc-700 dark:bg-zinc-900"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3 id="success-title" className="mb-2 text-lg font-semibold text-green-700 dark:text-green-400">
+              Загрузка завершена
+            </h3>
+            <p className="mb-4 text-zinc-600 dark:text-zinc-400">
+              workspace.dsl успешно импортирован. Данные продукта обновлены.
+            </p>
+            <button
+              type="button"
+              onClick={() => setSuccessPopup(false)}
+              className="w-full rounded-lg bg-amber-600 px-4 py-2 font-medium text-white hover:bg-amber-700"
+            >
+              OK
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function InfoSection({
   product,
   onProductUpdate,
+  onReload,
 }: {
   product: ProductFull;
   onProductUpdate: (p: ProductFull) => void;
+  onReload?: () => void;
 }) {
   const handleSaveName = useCallback(
     async (value: string) => {
@@ -268,12 +615,21 @@ function InfoSection({
     [product, onProductUpdate]
   );
 
+  const handleSaveStructurizr = useCallback(
+    async (payload: {
+      structurizrApiUrl?: string;
+      structurizrApiKey?: string;
+      structurizrApiSecret?: string;
+      structurizrWorkspaceName?: string;
+    }) => {
+      await patchProductWorkspace(product.alias, payload);
+      onProductUpdate({ ...product, ...payload });
+    },
+    [product, onProductUpdate]
+  );
+
   const items: { label: string; value?: string; isSecret?: boolean }[] = [
     { label: "Alias", value: product.alias },
-    { label: "Structurizr API URL", value: product.structurizrApiUrl },
-    { label: "Structurizr API Key", value: product.structurizrApiKey, isSecret: true },
-    { label: "Structurizr API Secret", value: product.structurizrApiSecret, isSecret: true },
-    { label: "Structurizr Workspace", value: product.structurizrWorkspaceName },
     { label: "Источник", value: product.source },
     { label: "Дата обновления", value: product.uploadDate ? new Date(product.uploadDate).toLocaleString("ru") : undefined },
     { label: "Критичность", value: product.critical },
@@ -282,6 +638,9 @@ function InfoSection({
 
   return (
     <div className="space-y-3 [&>*:last-child]:border-b-0">
+      {onReload && (
+        <DslUploadBlock productAlias={product.alias} onSuccess={onReload} />
+      )}
       <div className="flex gap-4 border-b border-zinc-200 py-2 dark:border-zinc-700">
         <span className="w-48 shrink-0 font-medium text-zinc-600 dark:text-zinc-400">
           Код (alias)
@@ -308,6 +667,10 @@ function InfoSection({
         label="Git URL"
         value={product.gitUrl ?? ""}
         onSave={handleSaveGitUrl}
+      />
+      <StructurizrFieldsBlock
+        product={product}
+        onSave={handleSaveStructurizr}
       />
       {items.map((item) => {
         if (item.label === "Alias" || item.label === "Название" || item.label === "Описание" || item.label === "Git URL") return null;
@@ -960,8 +1323,12 @@ function FitnessSection({ assessment }: { assessment: AssessmentResponse | null 
                     {ff.isCheck ? "✓ Пройдена" : "✗ Не пройдена"}
                   </span>
                 </td>
-                <td className="max-w-xs truncate px-4 py-2 text-sm text-zinc-600 dark:text-zinc-400">
-                  {ff.resultDetails || "—"}
+                <td className="max-w-md px-4 py-2 text-sm text-zinc-600 dark:text-zinc-400 [&_a]:text-amber-600 [&_a]:hover:underline dark:[&_a]:text-amber-400">
+                  {ff.resultDetails ? (
+                    <span dangerouslySetInnerHTML={{ __html: ff.resultDetails }} />
+                  ) : (
+                    "—"
+                  )}
                 </td>
               </tr>
             ))}
@@ -979,8 +1346,6 @@ export default function ProductDetailPage() {
   const [users, setUsers] = useState<ProductUser[]>([]);
   const [containers, setContainers] = useState<ContainerWithInterfaces[]>([]);
   const [assessment, setAssessment] = useState<AssessmentResponse | null>(null);
-  const [techCapabilities, setTechCapabilities] = useState<ProductTechCapability[]>([]);
-  const [capabilitiesLoading, setCapabilitiesLoading] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<TabId>("info");
@@ -1006,35 +1371,36 @@ export default function ProductDetailPage() {
     }
   }, []);
 
-  const loadTechCapabilities = useCallback(
-    async (a: string, containerNames: string[]) => {
-      setCapabilitiesLoading(true);
-      try {
-        const caps = await getProductTechCapabilities(a, containerNames);
-        setTechCapabilities(caps);
-      } catch {
-        setTechCapabilities([]);
-      } finally {
-        setCapabilitiesLoading(false);
+  const techCapabilities = useMemo(() => {
+    const byId = new Map<number, ProductTechCapability>();
+    for (const container of containers) {
+      for (const iface of container.interfaces ?? []) {
+        const tc = iface.techCapability;
+        if (tc?.id && !byId.has(tc.id)) {
+          byId.set(tc.id, {
+            id: tc.id,
+            code: tc.code,
+            name: tc.name,
+          });
+        }
+        for (const op of iface.operations ?? []) {
+          const opTc = op.techCapability;
+          if (opTc?.id && !byId.has(opTc.id)) {
+            byId.set(opTc.id, {
+              id: opTc.id,
+              code: opTc.code,
+              name: opTc.name,
+            });
+          }
+        }
       }
-    },
-    []
-  );
+    }
+    return Array.from(byId.values());
+  }, [containers]);
 
   useEffect(() => {
     if (aliasParam) load(aliasParam);
   }, [aliasParam, load]);
-
-  useEffect(() => {
-    if (activeTab === "capabilities" && aliasParam) {
-      const names = containers.map((c) => c.name).filter((n): n is string => !!n);
-      if (names.length > 0) {
-        loadTechCapabilities(aliasParam, names);
-      } else if (!loading) {
-        setTechCapabilities([]);
-      }
-    }
-  }, [activeTab, aliasParam, loadTechCapabilities, containers, loading]);
 
   if (loading && !product) {
     return (
@@ -1097,6 +1463,7 @@ export default function ProductDetailPage() {
           <InfoSection
             product={product}
             onProductUpdate={setProduct}
+            onReload={() => load(aliasParam)}
           />
         )}
         {activeTab === "tech" && <TechSection techProducts={product.techProducts} />}
@@ -1107,7 +1474,7 @@ export default function ProductDetailPage() {
         {activeTab === "capabilities" && (
           <TechCapabilitiesSection
             capabilities={techCapabilities}
-            loading={capabilitiesLoading}
+            loading={loading}
           />
         )}
       </div>

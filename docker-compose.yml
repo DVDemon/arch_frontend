@@ -181,7 +181,7 @@ services:
       INTEGRATION_NOTIFICATION_SERVER_URL: "http://notificationserver"
       INTEGRATION_DOCUMENT_SERVER_URL: "http://documentserverurl"
       INTEGRATION_CAMUNDA_SERVER_URL: "http://camundaserverurl"
-      INTEGRATION_ARCH_SERVER_URL: "http://archserverurl"
+      INTEGRATION_ARCH_SERVER_URL: http://structurizr-backend:8080
       INTEGRATION_GRAPH_VALIDATOR_SERVER_URL: "http://graphvalidatorserverurl"
       INTEGRATION_ARCHITECTURE_SERVER_URL: "http://architectureserverurl"
       INTEGRATION_AMBASSADOR_SERVER_URL: "http://stagemapicserverurl"
@@ -394,7 +394,7 @@ services:
 
   structurizr_backend:
     tty: true
-    container_name: structurizr_backend
+    container_name: structurizr-backend
     build:
       context: ./beeatlas-fdm-infrastructure/services/structurizr_backend
       dockerfile: Dockerfile

@@ -36,11 +36,31 @@ export interface UpdateProductPayload {
   employeesIds?: number[];
 }
 
+export interface PatchProductWorkspacePayload {
+  structurizrApiUrl?: string;
+  structurizrApiKey?: string;
+  structurizrApiSecret?: string;
+  structurizrWorkspaceName?: string;
+}
+
 export async function updateProduct(payload: UpdateProductPayload): Promise<void> {
   await fetchApi<void>(`${PRODUCT_BASE}/product`, {
     method: "PUT",
     body: JSON.stringify(payload),
   });
+}
+
+export async function patchProductWorkspace(
+  alias: string,
+  payload: PatchProductWorkspacePayload
+): Promise<void> {
+  await fetchApi<void>(
+    `${PRODUCT_BASE}/product/${encodeURIComponent(alias)}/workspace`,
+    {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    }
+  );
 }
 
 export async function getProductByAlias(alias: string): Promise<ProductFull> {
@@ -66,12 +86,16 @@ export async function getProductContainers(
 }
 
 export async function getProductFitnessFunctions(
-  alias: string
+  alias: string,
+  options?: { sourceType?: string; sourceId?: number }
 ): Promise<AssessmentResponse | null> {
   try {
-    return await fetchApi<AssessmentResponse>(
-      `${PRODUCT_BASE}/product/${encodeURIComponent(alias)}/fitness-function`
-    );
+    const params = new URLSearchParams();
+    if (options?.sourceType) params.set("source_type", options.sourceType);
+    if (options?.sourceId != null) params.set("source_id", String(options.sourceId));
+    const query = params.toString();
+    const url = `${PRODUCT_BASE}/product/${encodeURIComponent(alias)}/fitness-function${query ? `?${query}` : ""}`;
+    return await fetchApi<AssessmentResponse>(url);
   } catch {
     return null;
   }
@@ -100,4 +124,31 @@ export async function getProductTechCapabilities(
     `${PRODUCT_BASE}/product/implemented/container/tech-capability?${params}`
   );
   return Array.isArray(data) ? data : [];
+}
+
+const STRUCTURIZR_BASE = "/structurizr-backend";
+
+/**
+ * Кодирует UTF-8 строку в base64.
+ */
+function base64EncodeUtf8(str: string): string {
+  return btoa(unescape(encodeURIComponent(str)));
+}
+
+/**
+ * Загружает workspace.dsl и импортирует в FDM (dsl2fdm).
+ * Может выполняться долго — предусмотрен таймаут.
+ */
+export async function uploadWorkspaceDsl(
+  productAlias: string,
+  dslContent: string
+): Promise<void> {
+  const base64 = base64EncodeUtf8(dslContent);
+  await fetchApi<void>(`${STRUCTURIZR_BASE}/api/v1/dsl2fdm`, {
+    method: "POST",
+    body: JSON.stringify({
+      productAlias,
+      workspace: base64,
+    }),
+  });
 }
