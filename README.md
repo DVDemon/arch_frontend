@@ -171,6 +171,7 @@ npm run dev
 
 | Метод | Путь | Описание |
 |-------|------|----------|
+| POST | `/api/v1/workspace` | Создание workspace в On-Premises и обновление продукта (тело: `{ code, architect_name }`; может занимать минуты) |
 | POST | `/api/v1/dsl2fdm` | Импорт `workspace.dsl` в FDM: проверки, контейнеры, TC (тело: `{ productAlias, workspace: base64 }`) |
 
 #### Capabilities (`/api-gateway/capability/v1`)

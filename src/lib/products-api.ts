@@ -152,3 +152,66 @@ export async function uploadWorkspaceDsl(
     }),
   });
 }
+
+/** Ответ POST /api/v1/workspace (Structurizr On-Premises). */
+export interface StructurizrWorkspaceCreated {
+  id: number;
+  code?: string;
+  name?: string;
+  api_key?: string;
+  api_secret?: string;
+  api_url?: string;
+}
+
+const WORKSPACE_CREATE_TIMEOUT_MS = 180_000;
+
+/**
+ * Создаёт новый workspace в Structurizr On-Premises и обновляет продукт в BeeAtlas.
+ * Операция может занимать десятки секунд (CLI push шаблона).
+ */
+export async function createStructurizrWorkspace(
+  productCode: string,
+  architectName: string
+): Promise<StructurizrWorkspaceCreated> {
+  const API_BASE =
+    process.env.NEXT_PUBLIC_API_URL || "http://localhost:8080";
+  const url = `${API_BASE}${STRUCTURIZR_BASE}/api/v1/workspace`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), WORKSPACE_CREATE_TIMEOUT_MS);
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        code: productCode,
+        architect_name: architectName.trim(),
+      }),
+      signal: controller.signal,
+    });
+    const text = await res.text();
+    if (!res.ok) {
+      let message = text || res.statusText;
+      try {
+        const j = JSON.parse(text) as { detail?: string | unknown };
+        if (typeof j.detail === "string") message = j.detail;
+        else if (j.detail != null) message = JSON.stringify(j.detail);
+      } catch {
+        /* keep message */
+      }
+      throw new Error(`API error ${res.status}: ${message}`);
+    }
+    if (!text) {
+      throw new Error("Пустой ответ сервера");
+    }
+    return JSON.parse(text) as StructurizrWorkspaceCreated;
+  } catch (e) {
+    if (e instanceof Error && e.name === "AbortError") {
+      throw new Error(
+        `Превышено время ожидания (${WORKSPACE_CREATE_TIMEOUT_MS / 1000} с). Попробуйте снова.`
+      );
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}

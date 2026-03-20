@@ -381,16 +381,30 @@ services:
       - fdm-network
     restart: unless-stopped
 
-  structurizr-onpremises:
-    image: structurizr/onpremises:latest
-    container_name: structurizr-onpremises
-    restart: unless-stopped
+  on-premises:
+    image: structurizr/onpremises:2025.05.28
+    container_name: on-premises
     ports:
       - "8087:8080"
     volumes:
-      - structurizr-data:/usr/local/structurizr
+      - /data/on-premises/structurizr:/usr/local/structurizr
     networks:
       - fdm-network
+    command: >
+      sh -c "
+        if [ ! -f /usr/local/structurizr/structurizr.properties ]; then
+          echo 'Creating structurizr.properties with API key...'
+          echo 'structurizr.apiKey=$$2a$$10$$qlXOc8yhsUvt04Jf0PkctuWVYlLOy6iL8c9W72IXVwoYSASPcGEtq' > /usr/local/structurizr/structurizr.properties
+          echo 'Created'
+        fi
+        echo 'Starting Structurizr...'
+        exec catalina.sh run
+      "
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8080" ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
 
   structurizr_backend:
     tty: true
@@ -403,15 +417,16 @@ services:
     ports:
       - "8086:8080"
     environment:
-      - URL_ONPREMISES_WORKSPACE=http://structurizr-onpremises:8080/api/workspace
-      - URL_ONPREMISES_BASE=http://structurizr-onpremises:8080/api
-      - URL_DOCUMENTS=http://document-service:8080
-      - URL_TECHRADAR=http://techradar-backend:8080
-      - URL_PRODUCTS=http://products-service:8080
-      - URL_VEGA=https://vega.vimpelcom.ru
-      - ONPREMISES_PASSWORD=1234567890
+      URL_PRODUCTS: http://products-service:8080
+      URL_DOCUMENTS: https://document-service
+      URL_VEGA: https://vega.vimpelcom.ru
+      URL_TECHRADAR: http://techradar-backend:8080
+      URL_ONPREMISES_WORKSPACE: http://on-premises:8080/api/workspace
+      URL_ONPREMISES_BASE: http://on-premises:8080/api
+      ONPREMISES_PASSWORD: password
+
     depends_on:
-      - structurizr-onpremises
+      - on-premises
     networks:
       - fdm-network
 
