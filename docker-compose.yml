@@ -430,6 +430,131 @@ services:
     networks:
       - fdm-network
 
+  document_service_minio:
+    image: minio/minio:latest
+    container_name: document-service-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${DOCUMENT_MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${DOCUMENT_MINIO_ROOT_PASSWORD:-minioadmin}
+    ports:
+      - "${DOCUMENT_MINIO_API_PORT:-9000}:9000"
+      - "${DOCUMENT_MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - document-service-minio:/data
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:9000/minio/health/live" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - fdm-network
+
+  document_service_minio_init:
+    image: minio/mc:latest
+    container_name: document-service-minio-init
+    depends_on:
+      document_service_minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://document-service-minio:9000 ${DOCUMENT_MINIO_ROOT_USER:-minioadmin} ${DOCUMENT_MINIO_ROOT_PASSWORD:-minioadmin} &&
+      mc mb --ignore-existing local/${DOCUMENT_MINIO_BUCKET_NAME:-document-service-documents}
+      "
+    restart: "no"
+    networks:
+      - fdm-network
+
+  cx-service:
+    build:
+      context: ./beeatlas-fdm-infrastructure/services/cx-service
+      dockerfile: Dockerfile
+    container_name: cx-service
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - ./common.env
+    environment:
+      SPRING_JPA_HIBERNATE_DDL_AUTO: none
+      SPRING_JPA_PROPERTIES_HIBERNATE_DEFAULT_SCHEMA: cx
+      SPRING_FLYWAY_DEFAULT_SCHEMA: cx
+      SPRING_FLYWAY_BASELINE_ON_MIGRATE: "true"
+      SPRING_FLYWAY_CLEAN_DISABLED: "true"
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8080/actuator/health" ]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+    ports:
+      - "${CX_SERVICE_PORT:-8088}:8080"
+    networks:
+      - fdm-network
+    restart: unless-stopped
+
+  notifications-service:
+    build:
+      context: ./beeatlas-fdm-infrastructure/services/notifications-service
+      dockerfile: Dockerfile
+    container_name: notifications-service
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    env_file:
+      - ./common.env
+    environment:
+      SPRING_RABBITMQ_VIRTUAL_HOST: ${RABBITMQ_VHOST:-/}
+      SPRING_RABBITMQ_TEMPLATE_EXCHANGE: ${RABBITMQ_EXCHANGE:-capability.exchange}
+      SPRING_RABBITMQ_TEMPLATE_ROUTING_KEY: ${RABBITMQ_ROUTING_KEY:-capability.routing}
+      SPRING_JPA_HIBERNATE_DDL_AUTO: none
+      SPRING_JPA_PROPERTIES_HIBERNATE_DEFAULT_SCHEMA: notification
+      SPRING_FLYWAY_DEFAULT_SCHEMA: notification
+      SPRING_FLYWAY_BASELINE_ON_MIGRATE: "true"
+      SPRING_FLYWAY_CLEAN_DISABLED: "true"
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8080/actuator/health" ]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+    ports:
+      - "${NOTIFICATIONS_SERVICE_PORT:-8089}:8080"
+    networks:
+      - fdm-network
+    restart: unless-stopped
+    
+  document-service:
+    build:
+      context: ./beeatlas-fdm-infrastructure/services/document-service
+      dockerfile: Dockerfile
+    container_name: document-service
+    depends_on:
+      postgres:
+        condition: service_healthy
+      document_service_minio:
+        condition: service_healthy
+
+    env_file:
+      - ./common.env
+    environment:
+      SPRING_JPA_HIBERNATE_DDL_AUTO: none
+      SPRING_JPA_PROPERTIES_HIBERNATE_DEFAULT_SCHEMA: documents
+      SPRING_FLYWAY_DEFAULT_SCHEMA: documents
+      SPRING_FLYWAY_BASELINE_ON_MIGRATE: "true"
+      SPRING_FLYWAY_CLEAN_DISABLED: "true"
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8080/actuator/health" ]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+    ports:
+      - "${DOCUMENT_SERVICE_PORT:-8091}:8080"
+    networks:
+      - fdm-network
+    restart: unless-stopped
+
+
   beeatlas-frontend:
     build:
       context: .
@@ -462,3 +587,4 @@ volumes:
   neo4j_plugins:
   authentik-postgres-data:
   structurizr-data:
+  document-service-minio:
