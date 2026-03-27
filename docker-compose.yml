@@ -175,7 +175,7 @@ services:
       INTEGRATION_CAPABILITY_SERVER_URL: http://capability-backend:8080
       INTEGRATION_PRODUCTS_SERVER_URL: http://products-service:8080
       INTEGRATION_GRAPH_SERVER_URL: http://architect-graph-service:8080
-      INTEGRATION_CX_SERVER_URL: "http://cxserverurl"
+      INTEGRATION_CX_SERVER_URL: "http://cx-service:8080"
       INTEGRATION_PACK_LOADER_SERVER_URL: "http://packloaderserver"
       INTEGRATION_DASHBOARD_SERVER_URL: "http://dashboardserver"
       INTEGRATION_NOTIFICATION_SERVER_URL: "http://notificationserver"

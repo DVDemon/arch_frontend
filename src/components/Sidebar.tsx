@@ -8,6 +8,7 @@ const navItems = [
   { href: "/", label: "Главная", icon: "⌂" },
   { href: "/products", label: "Каталог продуктов", icon: "📦" },
   { href: "/capabilities", label: "Каталог возможностей", icon: "🔧" },
+  { href: "/cx", label: "CX", icon: "🧭" },
   { href: "/tech-radar", label: "Технический радар", icon: "📡" },
   { href: "/architecture", label: "Архитектура", icon: "🏗" },
 ];
