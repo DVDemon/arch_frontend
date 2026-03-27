@@ -1,0 +1,1404 @@
+import {
+  useEffect,
+  useRef,
+  useCallback,
+  useMemo,
+  useState,
+  forwardRef,
+  useImperativeHandle,
+} from 'react';
+import type { Simulation } from 'd3-force';
+import { graphEdgeLabel, type C4Node, type GraphEdge } from '../types/c4';
+import { C4_COLORS } from '../types/c4';
+import { createForceSimulation, type GraphLink, type SimNode } from '../lib/forceGraphLayout';
+import {
+  arrowAngleFromPolyline,
+  GRID_CELL,
+  labelPointAlongPolyline,
+  routeEdgeWithAStar,
+  type LayoutBox,
+  type Point,
+} from '../lib/astarGridRouter';
+import { buildDiagramSvgString } from '../lib/graphExportSvg';
+import { computeDiagramBounds } from '../lib/graphDiagramBounds';
+
+interface GraphCanvasProps {
+  nodes: C4Node[];
+  edges: GraphEdge[];
+  /** Центр окрестности (корень диаграммы) — подписи связей смещаются к другому концу ребра. */
+  focusNodeId?: string | null;
+  selectedNodeId: string | null;
+  /** Число локальных тегов по id узла (инциденты / точки отказа). */
+  tagCountByNodeId?: ReadonlyMap<string, number>;
+  onNodeClick: (node: C4Node) => void;
+  emptyHint?: string;
+  loading?: boolean;
+}
+
+export interface GraphCanvasHandle {
+  exportPng: () => void;
+  exportSvg: () => void;
+  zoomIn: () => void;
+  zoomOut: () => void;
+  resetZoom: () => void;
+  fitToScreen: () => void;
+}
+
+interface LayoutNode {
+  node: C4Node;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+interface ClusterMeta {
+  id: string;
+  members: C4Node[];
+  memberType: string;
+  edgeLabel: string;
+}
+
+const KNOWN = [
+  'SoftwareSystem',
+  'Container',
+  'Component',
+  'DeploymentNode',
+  'Environment',
+  'ContainerInstance',
+  'InfrastructureNode',
+];
+
+function getMainLabel(labels: string[]): string {
+  return labels.find((l) => KNOWN.includes(l)) || labels[0] || 'unknown';
+}
+
+function getLabelDisplay(label: string): string {
+  const map: Record<string, string> = {
+    SoftwareSystem: 'SYSTEM',
+    Container: 'CONTAINER',
+    Component: 'COMPONENT',
+    DeploymentNode: 'DEPLOY_NODE',
+    Environment: 'ENV',
+    ContainerInstance: 'INSTANCE',
+    InfrastructureNode: 'INFRA',
+  };
+  return map[label] || label.toUpperCase();
+}
+
+const EDGE_LABEL_FONT = '11px "JetBrains Mono", monospace';
+const EDGE_LABEL_LINE = 12;
+const EDGE_LABEL_PAD = 4;
+
+/** К какому концу ребра сместить подпись: к соседу, не совпадающему с фокусом диаграммы. */
+function labelBiasEnd(
+  focusId: string | null | undefined,
+  sourceId: string,
+  targetId: string
+): 'source' | 'target' | null {
+  if (!focusId) return null;
+  if (focusId === sourceId && targetId !== sourceId) return 'target';
+  if (focusId === targetId && sourceId !== targetId) return 'source';
+  return null;
+}
+
+function edgeStartsHorizontal(src: LayoutNode, tgt: LayoutNode): boolean {
+  return src.node.labels.length === 1 || tgt.node.labels.length === 1;
+}
+
+/** Белая «обводка» + серая линия: связь читается поверх заливки карточек (#FFF). */
+const EDGE_HALO_COLOR = '#FFFFFF';
+const EDGE_HALO_WIDTH = 4;
+const EDGE_STROKE_COLOR = '#BBBBBB';
+const EDGE_STROKE_WIDTH = 1.35;
+
+function tracePolylinePath(ctx: CanvasRenderingContext2D, points: Point[]): void {
+  if (points.length === 0) return;
+  ctx.moveTo(points[0]!.x, points[0]!.y);
+  for (let i = 1; i < points.length; i++) {
+    ctx.lineTo(points[i]!.x, points[i]!.y);
+  }
+}
+
+function strokePolylineOverNodes(ctx: CanvasRenderingContext2D, points: Point[]): void {
+  if (points.length < 2) return;
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  ctx.beginPath();
+  tracePolylinePath(ctx, points);
+  ctx.strokeStyle = EDGE_HALO_COLOR;
+  ctx.lineWidth = EDGE_HALO_WIDTH;
+  ctx.stroke();
+  ctx.beginPath();
+  tracePolylinePath(ctx, points);
+  ctx.strokeStyle = EDGE_STROKE_COLOR;
+  ctx.lineWidth = EDGE_STROKE_WIDTH;
+  ctx.stroke();
+}
+
+interface EdgeLabelGeom {
+  text: string;
+  x: number;
+  y: number;
+  align: CanvasTextAlign;
+}
+
+interface GeometryCache {
+  layoutVersion: number;
+  focusId: string | null;
+  edgePolylines: Point[][];
+  placedLabels: EdgeLabelGeom[];
+}
+
+const FAST_MODE_NODE_THRESHOLD = 70;
+const FAST_MODE_EDGE_THRESHOLD = 120;
+const PROGRESSIVE_EDGE_CHUNK_SIZE = 5;
+const PROGRESSIVE_EDGE_BUDGET_MS = 8;
+const SOFTWARE_SYSTEM_STRAIGHT_EDGE_THRESHOLD = 20;
+const CLUSTER_MIN_SIZE = 5;
+const CLUSTER_MEMBER_W = 120;
+const CLUSTER_MEMBER_H = 48;
+const CLUSTER_HEADER_H = 24;
+const CLUSTER_BOX_PADDING = GRID_CELL;
+
+function nodeMainLabel(node: C4Node): string {
+  return getMainLabel(node.labels);
+}
+
+function isClusterNode(node: C4Node): boolean {
+  return (node.properties as Record<string, unknown>).__cluster === true;
+}
+
+function dedupeEdges(edges: GraphEdge[]): GraphEdge[] {
+  const out: GraphEdge[] = [];
+  const seen = new Set<string>();
+  for (const e of edges) {
+    const key = `${e.source}|${e.target}|${e.type}|${e.technology ?? ''}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(e);
+  }
+  return out;
+}
+
+function clusterDimensions(memberCount: number): { width: number; height: number } {
+  const cols = Math.ceil(Math.sqrt(memberCount));
+  const rows = Math.ceil(memberCount / cols);
+  const innerW =
+    cols * CLUSTER_MEMBER_W + Math.max(0, cols - 1) * GRID_CELL;
+  const innerH =
+    rows * CLUSTER_MEMBER_H + Math.max(0, rows - 1) * GRID_CELL;
+  let width = CLUSTER_BOX_PADDING * 2 + innerW;
+  const height = CLUSTER_BOX_PADDING * 2 + CLUSTER_HEADER_H + innerH;
+  width = Math.max(width, height * 2); // 4:2 ratio
+  return { width, height };
+}
+
+function collapseDenseSimilarNodes(
+  nodes: C4Node[],
+  edges: GraphEdge[],
+  selectedNodeId: string | null
+): {
+  nodes: C4Node[];
+  edges: GraphEdge[];
+  clusters: Map<string, ClusterMeta>;
+  selectedVisibleId: string | null;
+} {
+  if (!selectedNodeId) {
+    return { nodes, edges, clusters: new Map(), selectedVisibleId: null };
+  }
+  const eligibleTypes = new Set(['Container', 'SoftwareSystem', 'Component']);
+  const byId = new Map(nodes.map((n) => [n.id, n]));
+  const candidates = new Map<
+    string,
+    { ids: Set<string>; memberType: string; edgeLabel: string }
+  >();
+
+  edges.forEach((edge) => {
+    const label = graphEdgeLabel(edge).trim();
+    const src = byId.get(edge.source);
+    const tgt = byId.get(edge.target);
+    if (!src || !tgt || !label) return;
+    const addCandidate = (member: C4Node) => {
+      if (member.id === selectedNodeId) return;
+      const memberType = nodeMainLabel(member);
+      if (!eligibleTypes.has(memberType)) return;
+      // Группируем по фактически отрисовываемой подписи связи + типу узла.
+      // Не завязываемся на конкретного соседа/направление, иначе похожие узлы не схлопываются.
+      const key = `${memberType}|${label}`;
+      let bucket = candidates.get(key);
+      if (!bucket) {
+        bucket = { ids: new Set<string>(), memberType, edgeLabel: label };
+        candidates.set(key, bucket);
+      }
+      bucket.ids.add(member.id);
+    };
+    addCandidate(src);
+    addCandidate(tgt);
+  });
+
+  const sortedGroups = [...candidates.entries()]
+    .map(([key, value]) => ({ key, ...value }))
+    .filter((x) => x.ids.size >= CLUSTER_MIN_SIZE)
+    .sort((a, b) => b.ids.size - a.ids.size);
+
+  if (sortedGroups.length === 0) {
+    return { nodes, edges, clusters: new Map(), selectedVisibleId: selectedNodeId };
+  }
+
+  const memberToCluster = new Map<string, string>();
+  const clusterNodes = new Map<string, C4Node>();
+  const clusters = new Map<string, ClusterMeta>();
+  const used = new Set<string>();
+
+  sortedGroups.forEach((g, idx) => {
+    const members = [...g.ids]
+      .filter((id) => !used.has(id) && id !== selectedNodeId)
+      .map((id) => byId.get(id))
+      .filter((n): n is C4Node => Boolean(n));
+    if (members.length < CLUSTER_MIN_SIZE) return;
+    members.forEach((m) => used.add(m.id));
+    const clusterId = `cluster:${g.memberType}:${idx}:${g.edgeLabel}`;
+    const dim = clusterDimensions(members.length);
+    const clusterNode: C4Node = {
+      id: clusterId,
+      labels: [g.memberType, 'ClusterGroup'],
+      name: `${g.memberType} x${members.length}`,
+      technology: g.edgeLabel,
+      properties: {
+        __cluster: true,
+        __clusterType: g.memberType,
+        __clusterSize: members.length,
+        __clusterEdgeLabel: g.edgeLabel,
+        __clusterWidth: dim.width,
+        __clusterHeight: dim.height,
+      },
+    };
+    clusters.set(clusterId, {
+      id: clusterId,
+      members,
+      memberType: g.memberType,
+      edgeLabel: g.edgeLabel,
+    });
+    clusterNodes.set(clusterId, clusterNode);
+    members.forEach((m) => memberToCluster.set(m.id, clusterId));
+  });
+
+  if (memberToCluster.size === 0) {
+    return { nodes, edges, clusters: new Map(), selectedVisibleId: selectedNodeId };
+  }
+
+  const outNodes: C4Node[] = [];
+  const added = new Set<string>();
+  nodes.forEach((n) => {
+    const clusterId = memberToCluster.get(n.id);
+    if (!clusterId) {
+      outNodes.push(n);
+      return;
+    }
+    if (!added.has(clusterId)) {
+      const node = clusterNodes.get(clusterId);
+      if (node) outNodes.push(node);
+      added.add(clusterId);
+    }
+  });
+
+  const outEdges = dedupeEdges(
+    edges
+      .map((e) => ({
+        ...e,
+        source: memberToCluster.get(e.source) ?? e.source,
+        target: memberToCluster.get(e.target) ?? e.target,
+      }))
+      .filter((e) => e.source !== e.target)
+  );
+
+  return {
+    nodes: outNodes,
+    edges: outEdges,
+    clusters,
+    selectedVisibleId: memberToCluster.get(selectedNodeId) ?? selectedNodeId,
+  };
+}
+
+function hitTestClusterMember(
+  ln: LayoutNode,
+  clusterMeta: ClusterMeta,
+  x: number,
+  y: number
+): C4Node | null {
+  const cols = Math.ceil(Math.sqrt(clusterMeta.members.length));
+  const innerStartX = ln.x + CLUSTER_BOX_PADDING;
+  const innerStartY = ln.y + CLUSTER_BOX_PADDING + CLUSTER_HEADER_H;
+  for (let idx = 0; idx < clusterMeta.members.length; idx++) {
+    const col = idx % cols;
+    const row = Math.floor(idx / cols);
+    const mx = innerStartX + col * (CLUSTER_MEMBER_W + GRID_CELL);
+    const my = innerStartY + row * (CLUSTER_MEMBER_H + GRID_CELL);
+    if (x >= mx && x <= mx + CLUSTER_MEMBER_W && y >= my && y <= my + CLUSTER_MEMBER_H) {
+      return clusterMeta.members[idx] ?? null;
+    }
+  }
+  return null;
+}
+
+function labelBoundingBox(
+  ctx: CanvasRenderingContext2D,
+  g: EdgeLabelGeom
+): { left: number; top: number; right: number; bottom: number } {
+  ctx.font = EDGE_LABEL_FONT;
+  const w = ctx.measureText(g.text).width;
+  const pad = EDGE_LABEL_PAD;
+  let left: number;
+  if (g.align === 'center') left = g.x - w / 2 - pad;
+  else if (g.align === 'right') left = g.x - w - pad;
+  else left = g.x - pad;
+  const top = g.y - EDGE_LABEL_LINE - pad;
+  return {
+    left,
+    top,
+    right: left + w + pad * 2,
+    bottom: top + EDGE_LABEL_LINE + pad * 2,
+  };
+}
+
+function boxesOverlap(
+  a: { left: number; top: number; right: number; bottom: number },
+  b: { left: number; top: number; right: number; bottom: number }
+): boolean {
+  return !(a.right < b.left || b.right < a.left || a.bottom < b.top || b.bottom < a.top);
+}
+
+/** Push labels apart vertically (greedy) so bounding boxes do not overlap. */
+function resolveEdgeLabelOverlaps(
+  ctx: CanvasRenderingContext2D,
+  labels: EdgeLabelGeom[]
+): EdgeLabelGeom[] {
+  if (labels.length === 0) return [];
+  const sorted = [...labels].sort((a, b) => a.y - b.y || a.x - b.x);
+  const placed: EdgeLabelGeom[] = [];
+  const step = 15;
+  const maxShift = 120;
+
+  for (const g of sorted) {
+    let cur: EdgeLabelGeom = { ...g };
+    let box = labelBoundingBox(ctx, cur);
+    let n = 0;
+    while (n * step < maxShift) {
+      let hit = false;
+      for (const p of placed) {
+        if (boxesOverlap(box, labelBoundingBox(ctx, p))) {
+          hit = true;
+          break;
+        }
+      }
+      if (!hit) break;
+      cur = { ...cur, y: cur.y + step };
+      box = labelBoundingBox(ctx, cur);
+      n += 1;
+    }
+    placed.push(cur);
+  }
+  return placed;
+}
+
+function roundRectPath(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  r: number
+) {
+  const rr = Math.min(r, w / 2, h / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + rr, y);
+  ctx.arcTo(x + w, y, x + w, y + h, rr);
+  ctx.arcTo(x + w, y + h, x, y + h, rr);
+  ctx.arcTo(x, y + h, x, y, rr);
+  ctx.arcTo(x, y, x + w, y, rr);
+  ctx.closePath();
+}
+
+/** Бейдж: иконка инцидента + число тегов (правый верх карточки). */
+function drawTagBadge(
+  ctx: CanvasRenderingContext2D,
+  ln: LayoutNode,
+  count: number
+): void {
+  if (count <= 0) return;
+  const pad = 4;
+  const badgeH = 18;
+  const iconSlot = 12;
+  const countStr = String(count);
+  ctx.font = 'bold 10px "JetBrains Mono", monospace';
+  const tw = ctx.measureText(countStr).width;
+  const badgeW = Math.min(iconSlot + 4 + tw + 6, ln.width - pad * 2);
+  const rx = ln.x + ln.width - badgeW - pad;
+  const ry = ln.y + pad;
+
+  ctx.fillStyle = '#FFF3E0';
+  ctx.strokeStyle = '#E65100';
+  ctx.lineWidth = 1;
+  roundRectPath(ctx, rx, ry, badgeW, badgeH, 4);
+  ctx.fill();
+  ctx.stroke();
+
+  const tx = rx + 5;
+  const ty = ry + badgeH / 2;
+  ctx.beginPath();
+  ctx.moveTo(tx, ty - 4);
+  ctx.lineTo(tx + 4, ty + 3);
+  ctx.lineTo(tx - 4, ty + 3);
+  ctx.closePath();
+  ctx.fillStyle = '#E65100';
+  ctx.fill();
+
+  ctx.fillStyle = '#BF360C';
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'middle';
+  ctx.font = 'bold 10px "JetBrains Mono", monospace';
+  ctx.fillText(countStr, rx + iconSlot + 2, ry + badgeH / 2);
+}
+
+function drawEdgeLabelPill(ctx: CanvasRenderingContext2D, g: EdgeLabelGeom) {
+  ctx.font = EDGE_LABEL_FONT;
+  const m = ctx.measureText(g.text);
+  const w = m.width;
+  const pad = EDGE_LABEL_PAD;
+  let rx: number;
+  if (g.align === 'center') rx = g.x - w / 2 - pad;
+  else if (g.align === 'right') rx = g.x - w - pad;
+  else rx = g.x - pad;
+  const ry = g.y - EDGE_LABEL_LINE - pad;
+  const rw = w + pad * 2;
+  const rh = EDGE_LABEL_LINE + pad * 2;
+
+  ctx.fillStyle = 'rgba(250, 250, 250, 0.95)';
+  roundRectPath(ctx, rx, ry, rw, rh, 4);
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(180, 180, 180, 0.95)';
+  ctx.lineWidth = 1;
+  ctx.stroke();
+
+  ctx.fillStyle = '#444444';
+  ctx.textBaseline = 'alphabetic';
+  ctx.textAlign = g.align;
+  ctx.fillText(g.text, g.x, g.y);
+}
+
+function buildEdgeGeometry(
+  layout: LayoutNode[],
+  edges: GraphEdge[],
+  focusId: string | null | undefined
+): { edgePolylines: Point[][]; labelCandidates: EdgeLabelGeom[] } {
+  const nodeMap = new Map(layout.map((ln) => [ln.node.id, ln]));
+  const layoutBoxes: LayoutBox[] = layout.map((ln) => ({
+    id: ln.node.id,
+    x: ln.x,
+    y: ln.y,
+    width: ln.width,
+    height: ln.height,
+  }));
+  const edgePolylines: Point[][] = [];
+  const labelCandidates: EdgeLabelGeom[] = [];
+  const seen = new Set<string>();
+
+  edges.forEach((edge) => {
+    const labelText = graphEdgeLabel(edge);
+    const pair =
+      edge.source < edge.target
+        ? `${edge.source}|${edge.target}`
+        : `${edge.target}|${edge.source}`;
+    const dedupeKey = `${pair}|${labelText}`;
+    if (seen.has(dedupeKey)) return;
+    seen.add(dedupeKey);
+
+    const src = nodeMap.get(edge.source);
+    const tgt = nodeMap.get(edge.target);
+    if (!src || !tgt) return;
+
+    const srcBox: LayoutBox = {
+      id: src.node.id,
+      x: src.x,
+      y: src.y,
+      width: src.width,
+      height: src.height,
+    };
+    const tgtBox: LayoutBox = {
+      id: tgt.node.id,
+      x: tgt.x,
+      y: tgt.y,
+      width: tgt.width,
+      height: tgt.height,
+    };
+
+    const horizontalFirst = edgeStartsHorizontal(src, tgt);
+    const points = routeEdgeWithAStar(srcBox, tgtBox, layoutBoxes, horizontalFirst);
+    edgePolylines.push(points);
+
+    if (labelText) {
+      const bias = labelBiasEnd(focusId, edge.source, edge.target);
+      const anchor = labelPointAlongPolyline(points, bias);
+      labelCandidates.push({
+        text: labelText,
+        x: anchor.x,
+        y: anchor.y,
+        align: anchor.align,
+      });
+    }
+  });
+
+  return { edgePolylines, labelCandidates };
+}
+
+function rectBoundaryPointToward(from: LayoutNode, toX: number, toY: number): Point {
+  const cx = from.x + from.width / 2;
+  const cy = from.y + from.height / 2;
+  const dx = toX - cx;
+  const dy = toY - cy;
+  const hw = from.width / 2;
+  const hh = from.height / 2;
+  if (Math.abs(dx) < 1e-6 && Math.abs(dy) < 1e-6) return { x: cx, y: cy };
+  const sx = Math.abs(dx) / Math.max(hw, 1e-6);
+  const sy = Math.abs(dy) / Math.max(hh, 1e-6);
+  const k = 1 / Math.max(sx, sy, 1e-6);
+  return { x: cx + dx * k, y: cy + dy * k };
+}
+
+function buildEdgeGeometryStraight(
+  layout: LayoutNode[],
+  edges: GraphEdge[],
+  focusId: string | null | undefined
+): { edgePolylines: Point[][]; labelCandidates: EdgeLabelGeom[] } {
+  const nodeMap = new Map(layout.map((ln) => [ln.node.id, ln]));
+  const edgePolylines: Point[][] = [];
+  const labelCandidates: EdgeLabelGeom[] = [];
+
+  edges.forEach((edge) => {
+    const src = nodeMap.get(edge.source);
+    const tgt = nodeMap.get(edge.target);
+    if (!src || !tgt) return;
+    const srcC = { x: src.x + src.width / 2, y: src.y + src.height / 2 };
+    const tgtC = { x: tgt.x + tgt.width / 2, y: tgt.y + tgt.height / 2 };
+    const p1 = rectBoundaryPointToward(src, tgtC.x, tgtC.y);
+    const p2 = rectBoundaryPointToward(tgt, srcC.x, srcC.y);
+    const points = [p1, p2];
+    edgePolylines.push(points);
+
+    const labelText = graphEdgeLabel(edge);
+    if (labelText) {
+      const bias = labelBiasEnd(focusId, edge.source, edge.target);
+      const anchor = labelPointAlongPolyline(points, bias);
+      labelCandidates.push({
+        text: labelText,
+        x: anchor.x,
+        y: anchor.y,
+        align: anchor.align,
+      });
+    }
+  });
+
+  return { edgePolylines, labelCandidates };
+}
+
+function paintDiagramNodes(
+  ctx: CanvasRenderingContext2D,
+  layout: LayoutNode[],
+  sel: string | null,
+  tagCountByNodeId: ReadonlyMap<string, number>,
+  clusterMetaById: ReadonlyMap<string, ClusterMeta>
+): void {
+  layout.forEach((ln) => {
+    const mainLabel = getMainLabel(ln.node.labels);
+    const color = C4_COLORS[mainLabel] || '#777';
+    const isSelected = ln.node.id === sel;
+    const tagCount = tagCountByNodeId.get(ln.node.id) ?? 0;
+    const clusterMeta = clusterMetaById.get(ln.node.id);
+
+    if (clusterMeta && isClusterNode(ln.node)) {
+      ctx.save();
+      ctx.fillStyle = '#FFFFFF';
+      ctx.fillRect(ln.x, ln.y, ln.width, ln.height);
+
+      if (isSelected) {
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 2;
+      } else {
+        ctx.strokeStyle = '#9E9E9E';
+        ctx.lineWidth = 1.5;
+      }
+      ctx.setLineDash([8, 6]);
+      ctx.strokeRect(ln.x, ln.y, ln.width, ln.height);
+      ctx.setLineDash([]);
+
+      const p = ln.node.properties as Record<string, unknown>;
+      const edgeLabel = typeof p.__clusterEdgeLabel === 'string' ? p.__clusterEdgeLabel : '';
+      ctx.fillStyle = color;
+      ctx.font = 'bold 10px "JetBrains Mono", monospace';
+      ctx.fillText(`[GROUP ${clusterMeta.memberType.toUpperCase()}]`, ln.x + 10, ln.y + 15);
+      ctx.fillStyle = '#666666';
+      ctx.font = '10px "JetBrains Mono", monospace';
+      const title = `${clusterMeta.members.length} nodes${edgeLabel ? ` | ${edgeLabel}` : ''}`;
+      ctx.fillText(title, ln.x + 10, ln.y + 28);
+
+      const cols = Math.ceil(Math.sqrt(clusterMeta.members.length));
+      const innerStartX = ln.x + CLUSTER_BOX_PADDING;
+      const innerStartY = ln.y + CLUSTER_BOX_PADDING + CLUSTER_HEADER_H;
+      clusterMeta.members.forEach((member, idx) => {
+        const col = idx % cols;
+        const row = Math.floor(idx / cols);
+        const mx = innerStartX + col * (CLUSTER_MEMBER_W + GRID_CELL);
+        const my = innerStartY + row * (CLUSTER_MEMBER_H + GRID_CELL);
+        ctx.fillStyle = '#FDFDFD';
+        ctx.strokeStyle = '#D0D0D0';
+        ctx.lineWidth = 1;
+        ctx.fillRect(mx, my, CLUSTER_MEMBER_W, CLUSTER_MEMBER_H);
+        ctx.strokeRect(mx, my, CLUSTER_MEMBER_W, CLUSTER_MEMBER_H);
+        ctx.fillStyle = color;
+        ctx.font = '10px "JetBrains Mono", monospace';
+        const shortName =
+          member.name.length > 14 ? `${member.name.slice(0, 12)}...` : member.name;
+        ctx.fillText(shortName, mx + 8, my + 22);
+      });
+      ctx.restore();
+      return;
+    }
+
+    ctx.fillStyle = '#FFFFFF';
+    ctx.fillRect(ln.x, ln.y, ln.width, ln.height);
+
+    if (tagCount > 0) {
+      ctx.fillStyle = '#FFB74D';
+      ctx.fillRect(ln.x, ln.y, ln.width, 3);
+    }
+
+    if (isSelected) {
+      ctx.save();
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 2;
+      ctx.shadowColor = color;
+      ctx.shadowBlur = 10;
+      ctx.strokeRect(ln.x - 3, ln.y - 3, ln.width + 6, ln.height + 6);
+      ctx.restore();
+    }
+
+    ctx.strokeStyle = isSelected ? color : '#E0E0E0';
+    ctx.lineWidth = isSelected ? 2 : 1;
+    ctx.strokeRect(ln.x, ln.y, ln.width, ln.height);
+
+    ctx.fillStyle = color;
+    ctx.fillRect(ln.x, ln.y, 4, ln.height);
+
+    ctx.font = '10px "JetBrains Mono", monospace';
+    ctx.fillStyle = color;
+    ctx.textAlign = 'left';
+    ctx.fillText(`[${getLabelDisplay(mainLabel)}]`, ln.x + 12, ln.y + 18);
+
+    ctx.font = '12px "JetBrains Mono", monospace';
+    ctx.fillStyle = '#000000';
+    const name =
+      ln.node.name.length > 22 ? ln.node.name.slice(0, 20) + '...' : ln.node.name;
+    ctx.fillText(name, ln.x + 12, ln.y + 38);
+
+    if (ln.node.technology) {
+      ctx.font = '10px "JetBrains Mono", monospace';
+      ctx.fillStyle = '#888888';
+      const tech =
+        ln.node.technology.length > 26
+          ? ln.node.technology.slice(0, 24) + '...'
+          : ln.node.technology;
+      ctx.fillText(tech, ln.x + 12, ln.y + 56);
+    }
+
+    drawTagBadge(ctx, ln, tagCount);
+  });
+}
+
+function paintDiagramEdges(ctx: CanvasRenderingContext2D, edgePolylines: Point[][]): void {
+  edgePolylines.forEach((points) => {
+    strokePolylineOverNodes(ctx, points);
+    if (points.length < 2) return;
+    const angle = arrowAngleFromPolyline(points);
+    const tx = points[points.length - 1]!.x;
+    const ty = points[points.length - 1]!.y;
+    ctx.beginPath();
+    ctx.moveTo(tx, ty);
+    ctx.lineTo(tx - 8 * Math.cos(angle - 0.4), ty - 8 * Math.sin(angle - 0.4));
+    ctx.lineTo(tx - 8 * Math.cos(angle + 0.4), ty - 8 * Math.sin(angle + 0.4));
+    ctx.closePath();
+    ctx.fillStyle = EDGE_STROKE_COLOR;
+    ctx.fill();
+  });
+}
+
+/** Смещение панорамы: центр узла фокуса в центре видимой области canvas (логические px). */
+function computePanToCenterFocus(
+  canvas: HTMLCanvasElement,
+  layout: LayoutNode[],
+  focusId: string | null,
+  zoom: number
+): { x: number; y: number } | null {
+  if (!focusId) return null;
+  const ln = layout.find((l) => l.node.id === focusId);
+  if (!ln) return null;
+  const rect = canvas.getBoundingClientRect();
+  const cx = ln.x + ln.width / 2;
+  const cy = ln.y + ln.height / 2;
+  return {
+    x: rect.width / 2 - cx * zoom,
+    y: rect.height / 2 - cy * zoom,
+  };
+}
+
+const EXPORT_PAD = 48;
+
+function computeFullExportData(
+  layout: LayoutNode[],
+  edges: GraphEdge[],
+  focusId: string | null | undefined
+): {
+  bounds: { width: number; height: number; offsetX: number; offsetY: number };
+  edgePolylines: Point[][];
+  placedLabels: EdgeLabelGeom[];
+} | null {
+  if (layout.length === 0) return null;
+  const { edgePolylines, labelCandidates } = buildEdgeGeometry(layout, edges, focusId);
+  const tmp = document.createElement('canvas');
+  const ctx = tmp.getContext('2d');
+  if (!ctx) return null;
+  const placedLabels = resolveEdgeLabelOverlaps(ctx, labelCandidates);
+  const labelHints = placedLabels.map((g) => ({ x: g.x, y: g.y, text: g.text }));
+  const bounds = computeDiagramBounds(
+    layout.map((ln) => ({ x: ln.x, y: ln.y, width: ln.width, height: ln.height })),
+    edgePolylines,
+    labelHints,
+    EXPORT_PAD
+  );
+  return { bounds, edgePolylines, placedLabels };
+}
+
+export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function GraphCanvas(
+  {
+    nodes,
+    edges,
+    focusNodeId = null,
+    selectedNodeId,
+    tagCountByNodeId,
+    onNodeClick,
+    emptyHint,
+    loading,
+  },
+  ref
+) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const layoutRef = useRef<LayoutNode[]>([]);
+  const collapsedGraph = useMemo(
+    () => collapseDenseSimilarNodes(nodes, edges, selectedNodeId),
+    [nodes, edges, selectedNodeId]
+  );
+  const visibleNodes = collapsedGraph.nodes;
+  const visibleEdges = collapsedGraph.edges;
+  const selectedVisibleId = collapsedGraph.selectedVisibleId;
+  const clusterMetaRef = useRef<Map<string, ClusterMeta>>(new Map());
+  clusterMetaRef.current = collapsedGraph.clusters;
+  const edgesRef = useRef(visibleEdges);
+  edgesRef.current = visibleEdges;
+  const tagCountRef = useRef<ReadonlyMap<string, number>>(tagCountByNodeId ?? new Map());
+  tagCountRef.current = tagCountByNodeId ?? new Map();
+  const simNodesRef = useRef<SimNode[]>([]);
+  const simulationRef = useRef<Simulation<SimNode, GraphLink> | null>(null);
+  const panRef = useRef({ x: 0, y: 0 });
+  const zoomRef = useRef(1);
+  const hasInitialFitRef = useRef(false);
+  const layoutVersionRef = useRef(0);
+  const geometryCacheRef = useRef<GeometryCache | null>(null);
+  const fastModeRef = useRef(false);
+  const deferredFullGeometryReadyRef = useRef(false);
+  const progressiveTimerRef = useRef<number | null>(null);
+  const dragRef = useRef<{ dragging: boolean; lastX: number; lastY: number }>({
+    dragging: false,
+    lastX: 0,
+    lastY: 0,
+  });
+  const selectedIdRef = useRef<string | null>(selectedVisibleId);
+  selectedIdRef.current = selectedVisibleId;
+  const focusIdRef = useRef<string | null>(focusNodeId ?? null);
+  focusIdRef.current = focusNodeId ?? null;
+
+  const graphKey = useMemo(
+    () =>
+      JSON.stringify({
+        n: visibleNodes.map((n) => n.id).sort(),
+        e: visibleEdges.map((e) => `${e.source}|${e.target}|${e.type}|${e.technology ?? ''}`).sort(),
+      }),
+    [visibleNodes, visibleEdges]
+  );
+  const selectedNodeMapRef = useRef(new Map(visibleNodes.map((n) => [n.id, n])));
+  selectedNodeMapRef.current = new Map(visibleNodes.map((n) => [n.id, n]));
+
+  const [resizeTick, setResizeTick] = useState(0);
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    const parent = canvas?.parentElement;
+    if (!parent) return;
+    const ro = new ResizeObserver(() => setResizeTick((t) => t + 1));
+    ro.observe(parent);
+    return () => ro.disconnect();
+  }, []);
+
+  const simToLayout = useCallback((simNodes: SimNode[]): LayoutNode[] => {
+    return simNodes.map((s) => ({
+      node: s.node,
+      x: s.x ?? 0,
+      y: s.y ?? 0,
+      width: s.width,
+      height: s.height,
+    }));
+  }, []);
+
+  const fitToScreen = useCallback(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const layout = simToLayout(simNodesRef.current);
+    if (layout.length === 0) return;
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    layout.forEach((ln) => {
+      minX = Math.min(minX, ln.x);
+      minY = Math.min(minY, ln.y);
+      maxX = Math.max(maxX, ln.x + ln.width);
+      maxY = Math.max(maxY, ln.y + ln.height);
+    });
+    const worldW = Math.max(1, maxX - minX);
+    const worldH = Math.max(1, maxY - minY);
+    const rect = canvas.getBoundingClientRect();
+    const fitScale = Math.min(
+      1.4,
+      Math.max(0.45, Math.min((rect.width * 0.9) / worldW, (rect.height * 0.9) / worldH))
+    );
+    zoomRef.current = fitScale;
+    const worldCx = (minX + maxX) / 2;
+    const worldCy = (minY + maxY) / 2;
+    panRef.current = {
+      x: rect.width / 2 - worldCx * fitScale,
+      y: rect.height / 2 - worldCy * fitScale,
+    };
+    drawRef.current();
+  }, [simToLayout]);
+
+  const draw = useCallback(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const dpr = window.devicePixelRatio || 1;
+    const rect = canvas.getBoundingClientRect();
+    canvas.width = rect.width * dpr;
+    canvas.height = rect.height * dpr;
+    ctx.scale(dpr, dpr);
+
+    ctx.fillStyle = '#FAFAFA';
+    ctx.fillRect(0, 0, rect.width, rect.height);
+
+    const layout = simToLayout(simNodesRef.current);
+    layoutRef.current = layout;
+
+    const pan = panRef.current;
+    ctx.save();
+    ctx.translate(pan.x, pan.y);
+    const zoom = zoomRef.current;
+    ctx.scale(zoom, zoom);
+
+    const sel = selectedIdRef.current;
+    const focusId = focusIdRef.current;
+    let edgePolylines: Point[][];
+    let placedLabels: EdgeLabelGeom[];
+    const cached = geometryCacheRef.current;
+    if (
+      cached &&
+      cached.layoutVersion === layoutVersionRef.current &&
+      cached.focusId === focusId
+    ) {
+      edgePolylines = cached.edgePolylines;
+      placedLabels = cached.placedLabels;
+    } else {
+      const useFastGeometry = fastModeRef.current && !deferredFullGeometryReadyRef.current;
+      const selectedId = selectedIdRef.current;
+      const selectedNode = selectedId ? selectedNodeMapRef.current.get(selectedId) : undefined;
+      const selectedIsSoftwareSystem = Boolean(selectedNode?.labels.includes('SoftwareSystem'));
+      const connectedToSelected = selectedId
+        ? new Set(
+            visibleEdges
+              .filter((e) => e.source === selectedId || e.target === selectedId)
+              .map((e) => (e.source === selectedId ? e.target : e.source))
+          ).size
+        : 0;
+      const useStraightEdges =
+        selectedIsSoftwareSystem && connectedToSelected > SOFTWARE_SYSTEM_STRAIGHT_EDGE_THRESHOLD;
+
+      const { edgePolylines: ep, labelCandidates } = useFastGeometry
+        ? { edgePolylines: [], labelCandidates: [] }
+        : useStraightEdges
+          ? buildEdgeGeometryStraight(layout, visibleEdges, focusId)
+          : buildEdgeGeometry(layout, visibleEdges, focusId);
+      const labelCtx = document.createElement('canvas').getContext('2d');
+      placedLabels =
+        !useFastGeometry && labelCtx ? resolveEdgeLabelOverlaps(labelCtx, labelCandidates) : [];
+      edgePolylines = ep;
+      geometryCacheRef.current = {
+        layoutVersion: layoutVersionRef.current,
+        focusId,
+        edgePolylines,
+        placedLabels,
+      };
+    }
+
+    paintDiagramNodes(ctx, layout, sel, tagCountRef.current, clusterMetaRef.current);
+    paintDiagramEdges(ctx, edgePolylines);
+    placedLabels.forEach((g) => drawEdgeLabelPill(ctx, g));
+
+    ctx.restore();
+  }, [visibleEdges, simToLayout, focusNodeId]);
+
+  const drawRef = useRef(draw);
+  drawRef.current = draw;
+
+  useImperativeHandle(
+    ref,
+    () => ({
+      exportPng: () => {
+        const layout = simToLayout(simNodesRef.current);
+        const data = computeFullExportData(layout, edgesRef.current, focusIdRef.current);
+        if (!data) return;
+        const { bounds, edgePolylines, placedLabels } = data;
+        if (bounds.width <= 0 || bounds.height <= 0) return;
+
+        const dpr = window.devicePixelRatio || 1;
+        const off = document.createElement('canvas');
+        off.width = Math.ceil(bounds.width * dpr);
+        off.height = Math.ceil(bounds.height * dpr);
+        const ctx = off.getContext('2d');
+        if (!ctx) return;
+        ctx.scale(dpr, dpr);
+        ctx.fillStyle = '#FAFAFA';
+        ctx.fillRect(0, 0, bounds.width, bounds.height);
+        ctx.save();
+        ctx.translate(bounds.offsetX, bounds.offsetY);
+
+        const sel = selectedIdRef.current;
+        paintDiagramNodes(ctx, layout, sel, tagCountRef.current, clusterMetaRef.current);
+        paintDiagramEdges(ctx, edgePolylines);
+        placedLabels.forEach((g) => drawEdgeLabelPill(ctx, g));
+        ctx.restore();
+
+        const a = document.createElement('a');
+        a.href = off.toDataURL('image/png');
+        a.download = 'archmap-diagram.png';
+        a.click();
+      },
+      exportSvg: () => {
+        const layout = simToLayout(simNodesRef.current);
+        const data = computeFullExportData(layout, edgesRef.current, focusIdRef.current);
+        if (!data) return;
+        const { bounds, edgePolylines, placedLabels } = data;
+
+        const layoutExport = layout.map((ln) => ({
+          x: ln.x,
+          y: ln.y,
+          width: ln.width,
+          height: ln.height,
+          id: ln.node.id,
+          name: ln.node.name,
+          technology: ln.node.technology,
+          labels: ln.node.labels,
+        }));
+
+        const tagCounts: Record<string, number> = {};
+        tagCountRef.current.forEach((n, id) => {
+          if (n > 0) tagCounts[id] = n;
+        });
+
+        const svg = buildDiagramSvgString({
+          width: bounds.width,
+          height: bounds.height,
+          panX: bounds.offsetX,
+          panY: bounds.offsetY,
+          layout: layoutExport,
+          edgePolylines: edgePolylines.map((p) => p.map((q) => ({ ...q }))),
+          edgeLabels: placedLabels.map((g) => ({
+            text: g.text,
+            x: g.x,
+            y: g.y,
+            align: g.align,
+          })),
+          selectedId: selectedIdRef.current,
+          tagCounts,
+        });
+        const blob = new Blob([svg], { type: 'image/svg+xml;charset=utf-8' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'archmap-diagram.svg';
+        a.click();
+        URL.revokeObjectURL(url);
+      },
+      zoomIn: () => {
+        zoomRef.current = Math.min(2.4, zoomRef.current * 1.12);
+        drawRef.current();
+      },
+      zoomOut: () => {
+        zoomRef.current = Math.max(0.35, zoomRef.current / 1.12);
+        drawRef.current();
+      },
+      resetZoom: () => {
+        zoomRef.current = 1;
+        const canvas = canvasRef.current;
+        if (canvas && focusIdRef.current) {
+          const layout = simToLayout(simNodesRef.current);
+          const p = computePanToCenterFocus(canvas, layout, focusIdRef.current, zoomRef.current);
+          if (p) panRef.current = p;
+        }
+        drawRef.current();
+      },
+      fitToScreen,
+    }),
+    [fitToScreen, simToLayout]
+  );
+
+  useEffect(() => {
+    if (progressiveTimerRef.current !== null) {
+      window.clearTimeout(progressiveTimerRef.current);
+      progressiveTimerRef.current = null;
+    }
+    simulationRef.current?.stop();
+    simulationRef.current = null;
+    simNodesRef.current = [];
+    panRef.current = { x: 0, y: 0 };
+    zoomRef.current = 1;
+    layoutVersionRef.current = 0;
+    geometryCacheRef.current = null;
+    deferredFullGeometryReadyRef.current = false;
+
+    if (visibleNodes.length === 0) {
+      drawRef.current();
+      return;
+    }
+
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    const rect = canvas.getBoundingClientRect();
+    const w = Math.max(rect.width, 320);
+    const h = Math.max(rect.height, 240);
+    const selected = selectedVisibleId
+      ? visibleNodes.find((n) => n.id === selectedVisibleId)
+      : null;
+    const selectedIsSoftwareSystem = Boolean(selected?.labels.includes('SoftwareSystem'));
+    const connectedToSelected = selectedVisibleId
+      ? new Set(
+          visibleEdges
+            .filter((e) => e.source === selectedVisibleId || e.target === selectedVisibleId)
+            .map((e) => (e.source === selectedVisibleId ? e.target : e.source))
+        ).size
+      : 0;
+    const useStraightEdges =
+      selectedIsSoftwareSystem && connectedToSelected > SOFTWARE_SYSTEM_STRAIGHT_EDGE_THRESHOLD;
+    fastModeRef.current =
+      selectedIsSoftwareSystem &&
+      (visibleNodes.length >= FAST_MODE_NODE_THRESHOLD || visibleEdges.length >= FAST_MODE_EDGE_THRESHOLD);
+
+    const { simulation, simNodes } = createForceSimulation(
+      visibleNodes,
+      visibleEdges,
+      w,
+      h,
+      selectedVisibleId
+    );
+    simNodesRef.current = simNodes;
+    simulationRef.current = simulation;
+
+    const tick = () => {
+      layoutVersionRef.current += 1;
+      geometryCacheRef.current = null;
+      drawRef.current();
+    };
+    const onEnd = () => {
+      const canvas = canvasRef.current;
+      if (canvas && !hasInitialFitRef.current) {
+        fitToScreen();
+        hasInitialFitRef.current = true;
+      } else if (canvas && focusIdRef.current) {
+        const layout = simToLayout(simNodesRef.current);
+        const p = computePanToCenterFocus(canvas, layout, focusIdRef.current, zoomRef.current);
+        if (p) {
+          panRef.current = p;
+        }
+      }
+      drawRef.current();
+    };
+    simulation.on('tick', tick);
+    simulation.on('end', onEnd);
+    simulation.alpha(1).restart();
+
+    if (fastModeRef.current) {
+      const layout = simToLayout(simNodesRef.current);
+      const nodeMap = new Map(layout.map((ln) => [ln.node.id, ln]));
+      const layoutBoxes: LayoutBox[] = layout.map((ln) => ({
+        id: ln.node.id,
+        x: ln.x,
+        y: ln.y,
+        width: ln.width,
+        height: ln.height,
+      }));
+      const focusId = focusIdRef.current;
+      const visibleEdgePairs = visibleEdges
+        .map((edge) => {
+          const src = nodeMap.get(edge.source);
+          const tgt = nodeMap.get(edge.target);
+          if (!src || !tgt) return null;
+          return { edge, src, tgt };
+        })
+        .filter(
+          (
+            v
+          ): v is { edge: GraphEdge; src: LayoutNode; tgt: LayoutNode } => v !== null
+        );
+
+      let cursor = 0;
+      const progressivePolylines: Point[][] = [];
+      const labelCandidates: EdgeLabelGeom[] = [];
+      geometryCacheRef.current = {
+        layoutVersion: layoutVersionRef.current,
+        focusId,
+        edgePolylines: [],
+        placedLabels: [],
+      };
+      drawRef.current();
+
+      const runChunk = () => {
+        const t0 = performance.now();
+        let processed = 0;
+        while (
+          cursor < visibleEdgePairs.length &&
+          processed < PROGRESSIVE_EDGE_CHUNK_SIZE &&
+          performance.now() - t0 < PROGRESSIVE_EDGE_BUDGET_MS
+        ) {
+          const { edge, src, tgt } = visibleEdgePairs[cursor]!;
+          const srcBox: LayoutBox = {
+            id: src.node.id,
+            x: src.x,
+            y: src.y,
+            width: src.width,
+            height: src.height,
+          };
+          const tgtBox: LayoutBox = {
+            id: tgt.node.id,
+            x: tgt.x,
+            y: tgt.y,
+            width: tgt.width,
+            height: tgt.height,
+          };
+          const points = useStraightEdges
+            ? [
+                rectBoundaryPointToward(src, tgt.x + tgt.width / 2, tgt.y + tgt.height / 2),
+                rectBoundaryPointToward(tgt, src.x + src.width / 2, src.y + src.height / 2),
+              ]
+            : routeEdgeWithAStar(srcBox, tgtBox, layoutBoxes, edgeStartsHorizontal(src, tgt));
+          progressivePolylines.push(points);
+
+          const labelText = graphEdgeLabel(edge);
+          if (labelText) {
+            const bias = labelBiasEnd(focusId, edge.source, edge.target);
+            const anchor = labelPointAlongPolyline(points, bias);
+            labelCandidates.push({
+              text: labelText,
+              x: anchor.x,
+              y: anchor.y,
+              align: anchor.align,
+            });
+          }
+          cursor += 1;
+          processed += 1;
+        }
+
+        geometryCacheRef.current = {
+          layoutVersion: layoutVersionRef.current,
+          focusId,
+          edgePolylines: [...progressivePolylines],
+          placedLabels: [],
+        };
+        drawRef.current();
+
+        if (cursor < visibleEdgePairs.length) {
+          progressiveTimerRef.current = window.setTimeout(runChunk, 16);
+          return;
+        }
+
+        const labelCtx = document.createElement('canvas').getContext('2d');
+        const placedLabels = labelCtx ? resolveEdgeLabelOverlaps(labelCtx, labelCandidates) : [];
+        geometryCacheRef.current = {
+          layoutVersion: layoutVersionRef.current,
+          focusId,
+          edgePolylines: progressivePolylines,
+          placedLabels,
+        };
+        deferredFullGeometryReadyRef.current = true;
+        progressiveTimerRef.current = null;
+        drawRef.current();
+      };
+
+      progressiveTimerRef.current = window.setTimeout(runChunk, 0);
+    } else {
+      deferredFullGeometryReadyRef.current = true;
+    }
+
+    return () => {
+      if (progressiveTimerRef.current !== null) {
+        window.clearTimeout(progressiveTimerRef.current);
+        progressiveTimerRef.current = null;
+      }
+      simulation.stop();
+    };
+  }, [fitToScreen, graphKey, resizeTick, simToLayout, selectedVisibleId, visibleEdges, visibleNodes]);
+
+  useEffect(() => {
+    drawRef.current();
+  }, [selectedVisibleId, focusNodeId, tagCountByNodeId]);
+
+  const handleMouseDown = (e: React.MouseEvent) => {
+    dragRef.current = { dragging: true, lastX: e.clientX, lastY: e.clientY };
+    const canvas = canvasRef.current;
+    if (canvas) canvas.style.cursor = 'grabbing';
+  };
+
+  const handleMouseMove = (e: React.MouseEvent) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    if (!dragRef.current.dragging) {
+      handleMouseHover(e);
+      return;
+    }
+    const dx = e.clientX - dragRef.current.lastX;
+    const dy = e.clientY - dragRef.current.lastY;
+    panRef.current.x += dx;
+    panRef.current.y += dy;
+    dragRef.current.lastX = e.clientX;
+    dragRef.current.lastY = e.clientY;
+    drawRef.current();
+    canvas.style.cursor = 'grabbing';
+  };
+
+  const handleWheel = (e: React.WheelEvent) => {
+    e.preventDefault();
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    const sx = e.clientX - rect.left;
+    const sy = e.clientY - rect.top;
+    const prevZoom = zoomRef.current;
+    const zoomDelta = e.deltaY < 0 ? 1.1 : 1 / 1.1;
+    const nextZoom = Math.min(2.4, Math.max(0.35, prevZoom * zoomDelta));
+    if (Math.abs(nextZoom - prevZoom) < 0.0001) return;
+
+    // Zoom around cursor point to keep navigation predictable.
+    const wx = (sx - panRef.current.x) / prevZoom;
+    const wy = (sy - panRef.current.y) / prevZoom;
+    zoomRef.current = nextZoom;
+    panRef.current.x = sx - wx * nextZoom;
+    panRef.current.y = sy - wy * nextZoom;
+    drawRef.current();
+  };
+
+  const handleMouseUp = () => {
+    dragRef.current.dragging = false;
+    const canvas = canvasRef.current;
+    if (canvas) canvas.style.cursor = 'grab';
+  };
+
+  const handleMouseHover = (e: React.MouseEvent) => {
+    const canvas = canvasRef.current;
+    if (!canvas || dragRef.current.dragging) return;
+    const rect = canvas.getBoundingClientRect();
+    const x = (e.clientX - rect.left - panRef.current.x) / zoomRef.current;
+    const y = (e.clientY - rect.top - panRef.current.y) / zoomRef.current;
+    const hovered = layoutRef.current.find(
+      (ln) => x >= ln.x && x <= ln.x + ln.width && y >= ln.y && y <= ln.y + ln.height
+    );
+    if (!hovered) {
+      canvas.style.cursor = 'grab';
+      return;
+    }
+    if (!isClusterNode(hovered.node)) {
+      canvas.style.cursor = 'pointer';
+      return;
+    }
+    const cm = clusterMetaRef.current.get(hovered.node.id);
+    if (cm && hitTestClusterMember(hovered, cm, x, y)) {
+      canvas.style.cursor = 'pointer';
+      return;
+    }
+    canvas.style.cursor = 'grab';
+  };
+
+  const handleClick = (e: React.MouseEvent) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    const x = (e.clientX - rect.left - panRef.current.x) / zoomRef.current;
+    const y = (e.clientY - rect.top - panRef.current.y) / zoomRef.current;
+
+    const clicked = layoutRef.current.find(
+      (ln) => x >= ln.x && x <= ln.x + ln.width && y >= ln.y && y <= ln.y + ln.height
+    );
+    if (clicked) {
+      // Клик по "объединяющему" пунктирному прямоугольнику (cluster) игнорируем.
+      // Drilldown должен происходить только по исходным узлам, не по агрегатам.
+      if (isClusterNode(clicked.node)) {
+        const cm = clusterMetaRef.current.get(clicked.node.id);
+        const member = cm ? hitTestClusterMember(clicked, cm, x, y) : null;
+        if (member) onNodeClick(member);
+        return;
+      }
+      onNodeClick(clicked.node);
+    }
+  };
+
+  return (
+    <div className="graph-canvas h-full w-full flex-1">
+      <canvas
+        ref={canvasRef}
+        style={{ width: '100%', height: '100%', cursor: 'grab' }}
+        onClick={handleClick}
+        onMouseDown={handleMouseDown}
+        onMouseMove={handleMouseMove}
+        onMouseOver={handleMouseHover}
+        onMouseEnter={handleMouseHover}
+        onMouseUp={handleMouseUp}
+        onMouseLeave={handleMouseUp}
+        onWheel={handleWheel}
+      />
+      {visibleNodes.length === 0 && (
+        <div className="graph-empty">
+          {loading ? (
+            <div>&gt; загрузка диаграммы…</div>
+          ) : (
+            <>
+              <div>&gt; нет узлов на диаграмме</div>
+              {emptyHint ? (
+                <div className="graph-empty-hint">{emptyHint}</div>
+              ) : (
+                <div>&gt; нет связей у выбранной системы или слишком узкий фильтр</div>
+              )}
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+});
+
+GraphCanvas.displayName = 'GraphCanvas';

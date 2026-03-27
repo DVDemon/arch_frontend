@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useParams } from "next/navigation";
 import Link from "next/link";
+import ProductArchMapTab from "@/components/ProductArchMapTab";
 import {
   getProductByAlias,
   getProductContainers,
@@ -24,7 +25,7 @@ import type {
   AssessmentResponse,
 } from "@/types/product-detail";
 
-type TabId = "info" | "tech" | "users" | "containers" | "fitness" | "context" | "capabilities";
+type TabId = "info" | "tech" | "users" | "containers" | "fitness" | "capabilities" | "diagram";
 
 const TABS: { id: TabId; label: string }[] = [
   { id: "info", label: "Информация" },
@@ -32,8 +33,8 @@ const TABS: { id: TabId; label: string }[] = [
   { id: "users", label: "Пользователи" },
   { id: "containers", label: "Контейнеры" },
   { id: "fitness", label: "Проверки архитектуры" },
-  { id: "context", label: "Context" },
   { id: "capabilities", label: "Технические возможности" },
+  { id: "diagram", label: "Диаграмма" },
 ];
 
 function SecretField({
@@ -1565,7 +1566,13 @@ export default function ProductDetailPage() {
         ))}
       </div>
 
-      <div className="rounded-xl border border-zinc-200 bg-white p-6 dark:border-zinc-800 dark:bg-zinc-900">
+      <div
+        className={`rounded-xl border border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-900 ${
+          activeTab === "diagram"
+            ? "h-[calc(100dvh-12rem)] overflow-hidden p-0"
+            : "p-6"
+        }`}
+      >
         {activeTab === "info" && (
           <InfoSection
             product={product}
@@ -1577,11 +1584,16 @@ export default function ProductDetailPage() {
         {activeTab === "users" && <UsersSection users={users} />}
         {activeTab === "containers" && <ContainersSection containers={containers} />}
         {activeTab === "fitness" && <FitnessSection assessment={assessment} />}
-        {activeTab === "context" && <ContextSection cmdb={product.alias} />}
         {activeTab === "capabilities" && (
           <TechCapabilitiesSection
             capabilities={techCapabilities}
             loading={loading}
+          />
+        )}
+        {activeTab === "diagram" && (
+          <ProductArchMapTab
+            productName={product.name || ""}
+            productAlias={product.alias}
           />
         )}
       </div>

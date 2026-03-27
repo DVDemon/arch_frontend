@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { cypherQueryAsciiForHeader } from "@/lib/cypherAsciiHeader";
 
 const API_BASE =
   process.env.API_URL ||
@@ -21,10 +22,13 @@ export async function POST(request: NextRequest) {
     }
 
     const url = `${API_BASE}/arch-graph/api/v1/elements`;
+    const safeQuery = cypherQueryAsciiForHeader(query)
+      .replace(/\r\n|\r|\n/g, " ")
+      .trim();
     const res = await fetch(url, {
       method: "GET",
       headers: {
-        "CYPHER-QUERY": query,
+        "CYPHER-QUERY": safeQuery,
         "Content-Type": "application/json",
       },
     });
