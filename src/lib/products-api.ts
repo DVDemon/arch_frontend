@@ -19,6 +19,18 @@ export async function getProductsAdmin(): Promise<Product[]> {
   return Array.isArray(data) ? data : [];
 }
 
+export async function getProductsByIds(ids: number[]): Promise<Product[]> {
+  if (!ids.length) return [];
+  const qp = new URLSearchParams();
+  for (const id of ids) {
+    if (!Number.isFinite(id)) continue;
+    qp.append("ids", String(id));
+  }
+  if (!qp.toString()) return [];
+  const data = await fetchApi<Product[]>(`${PRODUCT_BASE}/product/by-ids?${qp.toString()}`);
+  return Array.isArray(data) ? data : [];
+}
+
 export async function deleteProductByAlias(alias: string): Promise<void> {
   await fetchApi<void>(
     `${PRODUCT_BASE}/product/${encodeURIComponent(alias)}`,

@@ -1,5 +1,11 @@
-import { fetchApi } from "./api";
-import type { BiItem, BiUpsertPayload, CjItem, CjUpsertPayload } from "@/types/cx";
+import { API_BASE, fetchApi } from "./api";
+import type {
+  BiItem,
+  BiUpsertPayload,
+  CjFullDetail,
+  CjItem,
+  CjUpsertPayload,
+} from "@/types/cx";
 
 const CX_BASE = "/cx/api/cx";
 
@@ -54,6 +60,29 @@ export async function deleteCj(id: number): Promise<void> {
   });
 }
 
+export async function getCjDetail(id: number): Promise<CjFullDetail> {
+  return fetchApi<CjFullDetail>(`${CX_BASE}/v2/product/cj/${id}`);
+}
+
+async function postVoid(path: string, method: "POST" | "PATCH"): Promise<void> {
+  const url = `${API_BASE}${path}`;
+  const res = await fetch(url, { method });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`API error ${res.status}: ${text || res.statusText}`);
+  }
+}
+
+/** После загрузки BPMN в document-service — первичный разбор структуры CJ. */
+export async function importCjFromBpmnCreate(cjId: number): Promise<void> {
+  await postVoid(`${CX_BASE}/v1/bpmn/cj/${cjId}`, "POST");
+}
+
+/** Повторный импорт / обновление из BPMN, когда структура уже есть. */
+export async function importCjFromBpmnUpdate(cjId: number): Promise<void> {
+  await postVoid(`${CX_BASE}/v1/bpmn/cj/${cjId}`, "PATCH");
+}
+
 export async function getBiList(params?: {
   idProduct?: number;
   text?: string;
@@ -98,5 +127,40 @@ export async function updateBi(id: number, payload: Partial<BiUpsertPayload>): P
 export async function deleteBi(id: number): Promise<void> {
   await fetchApi<void>(`${CX_BASE}/v1/library/business-interactions/${id}`, {
     method: "DELETE",
+  });
+}
+
+export interface BiScenarioStepPatchPayload {
+  latency?: number;
+  errorRate?: number;
+  rps?: number;
+}
+
+export interface BiScenarioStepRelationUpsertPayload {
+  id?: number;
+  description?: string;
+  productId?: number;
+  tcId?: number;
+  operationId?: number;
+  interfaceId?: number;
+}
+
+export async function updateBiScenarioStep(
+  stepId: number,
+  payload: BiScenarioStepPatchPayload,
+): Promise<void> {
+  await fetchApi<void>(`${CX_BASE}/v1/library/business-interactions/step/${stepId}`, {
+    method: "PATCH",
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function putBiScenarioStepRelations(
+  stepId: number,
+  relations: BiScenarioStepRelationUpsertPayload[],
+): Promise<void> {
+  await fetchApi<void>(`${CX_BASE}/v1/library/business-interactions/step/${stepId}/relation`, {
+    method: "PUT",
+    body: JSON.stringify(relations),
   });
 }

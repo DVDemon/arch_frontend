@@ -1,6 +1,10 @@
 "use client";
 
+import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { BpmnDropzone } from "@/components/cx/bpmn-dropzone";
+import { uploadCjBpmnDocument } from "@/lib/document-api";
 import { getProducts, getProductsAdmin } from "@/lib/products-api";
 import {
   createBi,
@@ -9,6 +13,7 @@ import {
   deleteCj,
   getBiList,
   getCjList,
+  importCjFromBpmnCreate,
   updateBi,
   updateCj,
 } from "@/lib/cx-api";
@@ -50,6 +55,7 @@ function AddCjModal({
   saving,
   productsLoading,
   products,
+  cjNamesLower,
   onSubmit,
 }: {
   open: boolean;
@@ -57,12 +63,25 @@ function AddCjModal({
   saving: boolean;
   productsLoading: boolean;
   products: Product[];
-  onSubmit: (payload: { name: string; productId: number; userPortrait?: string }) => Promise<void>;
+  /** Уже существующие названия CJ (нижний регистр) для проверки уникальности. */
+  cjNamesLower: Set<string>;
+  onSubmit: (payload: {
+    name: string;
+    productId: number;
+    userPortrait?: string;
+    bpmnFile?: File | null;
+  }) => Promise<void>;
 }) {
   const [name, setName] = useState("");
   const [productId, setProductId] = useState("");
   const [userPortrait, setUserPortrait] = useState("");
+  const [bpmnFile, setBpmnFile] = useState<File | null>(null);
   const [formError, setFormError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!open || products.length !== 1) return;
+    setProductId(String(products[0].id));
+  }, [open, products]);
 
   if (!open) return null;
 
@@ -70,6 +89,11 @@ function AddCjModal({
     const parsedProductId = Number(productId);
     if (!name.trim()) {
       setFormError("Введите название CJ.");
+      return;
+    }
+    const key = name.trim().toLowerCase();
+    if (cjNamesLower.has(key)) {
+      setFormError("Название CJ должно быть уникальным.");
       return;
     }
     if (!Number.isFinite(parsedProductId) || parsedProductId <= 0) {
@@ -82,10 +106,12 @@ function AddCjModal({
         name: name.trim(),
         productId: parsedProductId,
         userPortrait: userPortrait.trim() || undefined,
+        bpmnFile,
       });
       setName("");
       setProductId("");
       setUserPortrait("");
+      setBpmnFile(null);
       onClose();
     } catch (e) {
       setFormError(e instanceof Error ? e.message : "Не удалось создать CJ.");
@@ -95,7 +121,7 @@ function AddCjModal({
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50" onClick={onClose}>
       <div
-        className="w-full max-w-lg rounded-xl border border-zinc-200 bg-white p-6 dark:border-zinc-700 dark:bg-zinc-900"
+        className="w-full max-w-2xl rounded-xl border border-zinc-200 bg-white p-6 dark:border-zinc-700 dark:bg-zinc-900"
         onClick={(e) => e.stopPropagation()}
       >
         <h3 className="mb-4 text-lg font-bold text-zinc-900 dark:text-zinc-100">Добавить CJ</h3>
@@ -127,9 +153,13 @@ function AddCjModal({
             </p>
           )}
           {!productsLoading && products.length === 0 && (
-            <p className="text-xs text-amber-700 dark:text-amber-300">
-              Нет доступных продуктов для создания CJ.
-            </p>
+            <div className="space-y-1 text-xs text-amber-700 dark:text-amber-300">
+              <p>Нет доступных продуктов для создания CJ.</p>
+              <p className="text-zinc-500 dark:text-zinc-400">
+                Если API вызывается без авторизации, products-service ждёт заголовок user-id: задайте в
+                .env.local переменные NEXT_PUBLIC_USER_ID и при необходимости NEXT_PUBLIC_USER_ROLES.
+              </p>
+            </div>
           )}
           <input
             value={userPortrait}
@@ -140,6 +170,26 @@ function AddCjModal({
             placeholder="User portrait (опц.)"
             className="w-full rounded border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-700 dark:bg-zinc-800"
           />
+          <div>
+            <p className="mb-2 text-xs font-medium text-zinc-600 dark:text-zinc-400">BPMN (опционально)</p>
+            <BpmnDropzone
+              file={bpmnFile}
+              onFile={setBpmnFile}
+              onInvalidExtension={() =>
+                setFormError("Ошибка обработки файла: нужен файл с расширением .bpmn.")
+              }
+              disabled={saving}
+            />
+            {bpmnFile && (
+              <button
+                type="button"
+                className="mt-2 text-xs text-zinc-600 underline dark:text-zinc-400"
+                onClick={() => setBpmnFile(null)}
+              >
+                Убрать файл
+              </button>
+            )}
+          </div>
           {formError && (
             <p className="text-sm text-red-700 dark:text-red-300">{formError}</p>
           )}
@@ -371,7 +421,12 @@ function AddBiModal({
             <p className="text-xs text-zinc-500 dark:text-zinc-400">Загрузка списка продуктов...</p>
           )}
           {!productsLoading && products.length === 0 && (
-            <p className="text-xs text-amber-700 dark:text-amber-300">Нет доступных продуктов для создания BI.</p>
+            <div className="space-y-1 text-xs text-amber-700 dark:text-amber-300">
+              <p>Нет доступных продуктов для создания BI.</p>
+              <p className="text-zinc-500 dark:text-zinc-400">
+                Без JWT задайте NEXT_PUBLIC_USER_ID (и при необходимости NEXT_PUBLIC_USER_ROLES) в .env.local.
+              </p>
+            </div>
           )}
           <input
             value={descr}
@@ -590,6 +645,7 @@ function EditBiModal({
 }
 
 export default function CxPage() {
+  const router = useRouter();
   const [activeTab, setActiveTab] = useState<"cj" | "bi">("cj");
   const [cjList, setCjList] = useState<CjItem[]>([]);
   const [biList, setBiList] = useState<BiItem[]>([]);
@@ -624,20 +680,20 @@ export default function CxPage() {
       userList = [];
     }
 
-    const needAdminFallback = !userList.some((p) => p.id > 0);
-    if (needAdminFallback) {
-      try {
-        adminList = await getProductsAdmin();
-      } catch {
-        adminList = [];
-      }
+    // Всегда запрашиваем и user, и admin: разные окружения отдают полный список по-разному;
+    // при отсутствии JWT оба могут упасть — тогда нужны NEXT_PUBLIC_USER_ID / USER_ROLES в env.
+    try {
+      adminList = await getProductsAdmin();
+    } catch {
+      adminList = [];
     }
 
     const merged = [...userList, ...adminList];
     const byId = new Map<number, Product>();
     for (const p of merged) {
-      if (p.id > 0 && !byId.has(p.id)) {
-        byId.set(p.id, p);
+      const id = Number(p.id);
+      if (Number.isFinite(id) && id > 0 && !byId.has(id)) {
+        byId.set(id, p);
       }
     }
 
@@ -685,6 +741,15 @@ export default function CxPage() {
   useEffect(() => {
     void loadAvailableProducts();
   }, [loadAvailableProducts]);
+
+  const cjNamesLower = useMemo(() => {
+    const s = new Set<string>();
+    for (const c of cjList) {
+      const n = (c.name || "").trim().toLowerCase();
+      if (n) s.add(n);
+    }
+    return s;
+  }, [cjList]);
 
   const filteredCj = useMemo(() => {
     const q = cjSearch.trim().toLowerCase();
@@ -765,16 +830,38 @@ export default function CxPage() {
     name: string;
     productId: number;
     userPortrait?: string;
+    bpmnFile?: File | null;
   }) => {
     setSaving(true);
     setError(null);
     try {
-      await createCj(payload.productId, {
+      const created = await createCj(payload.productId, {
         name: payload.name,
         user_portrait: payload.userPortrait,
         draft: true,
       });
+      const cjId = created.id;
+      if (payload.bpmnFile && cjId) {
+        try {
+          await uploadCjBpmnDocument(cjId, payload.bpmnFile);
+          await importCjFromBpmnCreate(cjId);
+        } catch (bpmnErr) {
+          const msg =
+            bpmnErr instanceof Error ? bpmnErr.message : "ошибка BPMN";
+          const is503 =
+            typeof msg === "string" && (msg.includes("503") || msg.includes("Service Unavailable"));
+          setError(
+            is503
+              ? "CJ создан. BPMN файл не прикреплён (сервис документов недоступен), попробуйте ещё раз на странице CJ."
+              : `CJ создан. BPMN файл не разобран (${msg}). Откройте карточку CJ и повторите импорт.`,
+          );
+          await loadCjData();
+          router.push(`/cx/${cjId}`);
+          return;
+        }
+      }
       await loadCjData();
+      router.push(`/cx/${cjId}`);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Ошибка создания CJ");
       throw e;
@@ -969,7 +1056,7 @@ export default function CxPage() {
             {loading ? (
               <div className="p-8 text-center text-sm text-zinc-500">Загрузка…</div>
             ) : (
-              <table className="w-full min-w-[1450px] text-sm">
+              <table className="w-full min-w-[1520px] text-sm">
                 <thead>
                   <tr className="border-b border-zinc-200 dark:border-zinc-700">
                     <th className="px-3 py-2 text-left">
@@ -977,6 +1064,7 @@ export default function CxPage() {
                         ID{sortLabel(cjSortKey === "id", cjSortDir)}
                       </button>
                     </th>
+                    <th className="px-3 py-2 text-left">Карточка</th>
                     <th className="px-3 py-2 text-left">
                       <button type="button" onClick={() => setCjSortKey("name")} className="font-semibold">
                         Название{sortLabel(cjSortKey === "name", cjSortDir)}
@@ -1005,6 +1093,14 @@ export default function CxPage() {
                   {filteredCj.map((x) => (
                     <tr key={x.id} className="border-b border-zinc-100 dark:border-zinc-800">
                       <td className="px-3 py-2 font-mono">{x.id}</td>
+                      <td className="px-3 py-2">
+                        <Link
+                          href={`/cx/${x.id}`}
+                          className="text-amber-700 underline hover:text-amber-800 dark:text-amber-400"
+                        >
+                          Открыть
+                        </Link>
+                      </td>
                       <td className="px-3 py-2">{x.name || "—"}</td>
                       <td className="px-3 py-2 font-mono text-xs">{x.uniqueIdent || "—"}</td>
                       <td className="px-3 py-2">{getCjPortrait(x) || "—"}</td>
@@ -1040,7 +1136,7 @@ export default function CxPage() {
                   ))}
                   {filteredCj.length === 0 && (
                     <tr>
-                      <td colSpan={11} className="px-3 py-6 text-center text-zinc-500">
+                      <td colSpan={12} className="px-3 py-6 text-center text-zinc-500">
                         Нет данных
                       </td>
                     </tr>
@@ -1188,6 +1284,7 @@ export default function CxPage() {
         saving={saving}
         productsLoading={productsLoading}
         products={products}
+        cjNamesLower={cjNamesLower}
         onSubmit={handleCreateCjFromModal}
       />
       {editingCj && (

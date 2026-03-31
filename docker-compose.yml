@@ -179,7 +179,7 @@ services:
       INTEGRATION_PACK_LOADER_SERVER_URL: "http://packloaderserver"
       INTEGRATION_DASHBOARD_SERVER_URL: "http://dashboardserver"
       INTEGRATION_NOTIFICATION_SERVER_URL: "http://notificationserver"
-      INTEGRATION_DOCUMENT_SERVER_URL: "http://documentserverurl"
+      INTEGRATION_DOCUMENT_SERVER_URL: "http://document-service:8080"
       INTEGRATION_CAMUNDA_SERVER_URL: "http://camundaserverurl"
       INTEGRATION_ARCH_SERVER_URL: http://structurizr-backend:8080
       INTEGRATION_GRAPH_VALIDATOR_SERVER_URL: "http://graphvalidatorserverurl"
@@ -568,6 +568,9 @@ services:
       API_URL: http://gateway:8080
       # URL для браузера (через порт хоста)
       NEXT_PUBLIC_API_URL: http://localhost:8080
+      # Без JWT gateway не подставляет user-id; для списка продуктов в CX задайте id пользователя из БД:
+      NEXT_PUBLIC_USER_ID: "1"
+      NEXT_PUBLIC_USER_ROLES: "ADMINISTRATOR"
     networks:
       - fdm-network
       
