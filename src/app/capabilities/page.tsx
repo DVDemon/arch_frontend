@@ -89,8 +89,10 @@ function TreeNode({
   return (
     <div className="select-none">
       <div
-        className={`flex items-center gap-1 py-1 px-2 rounded cursor-pointer hover:bg-zinc-100 dark:hover:bg-zinc-800 ${
-          isSelected ? "bg-amber-100 dark:bg-amber-900/40 text-amber-800 dark:text-amber-200" : ""
+        className={`group flex items-center gap-1 rounded-lg py-1.5 px-2 transition-colors ${
+          isSelected
+            ? "bg-amber-100/90 text-amber-900 shadow-sm ring-1 ring-amber-200 dark:bg-amber-900/40 dark:text-amber-100 dark:ring-amber-900/60"
+            : "hover:bg-zinc-100 dark:hover:bg-zinc-800/70"
         }`}
         style={{ paddingLeft: `${depth * 12 + 8}px` }}
       >
@@ -100,7 +102,7 @@ function TreeNode({
             ev.stopPropagation();
             setExpanded((prev) => !prev);
           }}
-          className="w-6 h-6 shrink-0 flex items-center justify-center rounded hover:bg-zinc-200 dark:hover:bg-zinc-700 text-zinc-600 dark:text-zinc-400"
+          className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-zinc-500 hover:bg-zinc-200 dark:text-zinc-400 dark:hover:bg-zinc-700"
           aria-label={expanded ? "Свернуть" : "Развернуть"}
         >
           {hasChildren ? (expanded ? "▼" : "▶") : "•"}
@@ -108,9 +110,11 @@ function TreeNode({
         <button
           type="button"
           onClick={() => onSelect("business", node.id)}
-          className="flex-1 text-left truncate min-w-0 flex items-center gap-1"
+          className="flex min-w-0 flex-1 items-center gap-1 truncate text-left"
         >
-          <span className="font-medium">{node.name || node.code || "—"}</span>
+          <span className={`truncate ${isSelected ? "font-semibold" : "font-medium"}`}>
+            {node.name || node.code || "—"}
+          </span>
           {node.isDomain && (
             <span title="Домен" className="text-zinc-500 dark:text-zinc-400">
               <DomainIcon />
@@ -119,7 +123,7 @@ function TreeNode({
         </button>
       </div>
       {expanded && hasChildren && (
-        <div>
+        <div className="mt-0.5 space-y-0.5">
           {(node.children || []).map((child) => (
             <TreeNode
               key={child.id}
@@ -425,7 +429,7 @@ function CapabilitiesContent() {
   }, []);
 
   return (
-    <div className="w-full">
+    <div className="flex h-full min-h-[calc(100dvh-8.5rem)] w-full flex-col">
       <h1 className="mb-6 text-2xl font-bold text-zinc-900 dark:text-zinc-100">
         Каталог возможностей
       </h1>
@@ -483,12 +487,12 @@ function CapabilitiesContent() {
         </div>
       )}
 
-      <div className="grid gap-6 lg:grid-cols-[320px_1fr]">
-        <div className="overflow-auto rounded-xl border border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-900">
+      <div className="grid flex-1 min-h-0 gap-6 lg:grid-cols-[360px_1fr]">
+        <div className="flex min-h-0 flex-col overflow-hidden rounded-xl border border-zinc-200 bg-white shadow-sm dark:border-zinc-800 dark:bg-zinc-900">
           <button
             type="button"
             onClick={() => setTreeExpanded((e) => !e)}
-            className="flex w-full items-center justify-between p-4 font-semibold text-zinc-900 dark:text-zinc-100 hover:bg-zinc-50 dark:hover:bg-zinc-800/50 rounded-t-xl transition-colors"
+            className="flex w-full items-center justify-between border-b border-zinc-200 p-4 font-semibold text-zinc-900 transition-colors hover:bg-zinc-50 dark:border-zinc-800 dark:text-zinc-100 dark:hover:bg-zinc-800/50"
           >
             Дерево возможностей
             <span className="text-zinc-500 dark:text-zinc-400 transition-transform" style={{ transform: treeExpanded ? "rotate(90deg)" : "rotate(0deg)" }}>
@@ -496,13 +500,13 @@ function CapabilitiesContent() {
             </span>
           </button>
           {treeExpanded && (loading ? (
-            <div className="p-8 text-center text-zinc-500 dark:text-zinc-400">Загрузка…</div>
+            <div className="flex flex-1 items-center justify-center p-8 text-zinc-500 dark:text-zinc-400">Загрузка…</div>
           ) : filteredTree.length === 0 ? (
-            <div className="p-8 text-center text-zinc-500 dark:text-zinc-400">
+            <div className="flex flex-1 items-center justify-center p-8 text-center text-zinc-500 dark:text-zinc-400">
               {searchFilter ? "Нет совпадений по фильтру" : "Нет данных"}
             </div>
           ) : (
-            <div className="max-h-[600px] overflow-y-auto pb-4">
+            <div className="min-h-0 flex-1 overflow-y-auto px-2 py-2">
               {filteredTree.map((node) => (
                 <TreeNode
                   key={node.id}
@@ -516,7 +520,7 @@ function CapabilitiesContent() {
           ))}
         </div>
 
-        <div>
+        <div className="min-h-0 overflow-auto rounded-xl">
           <DetailCard
             selected={selected}
             business={businessDetail}

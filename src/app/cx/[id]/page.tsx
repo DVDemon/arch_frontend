@@ -353,6 +353,16 @@ export default function CjDetailPage() {
                 <p className="text-sm text-zinc-600 dark:text-zinc-400">
                   Загрузите файл в хранилище документов и запустите разбор в CX (как при создании CJ).
                 </p>
+                <p className="text-xs text-zinc-500 dark:text-zinc-400">
+                  Пример файла:{" "}
+                  <a
+                    href="/example.bpmn"
+                    download="example.bpmn"
+                    className="text-amber-700 underline hover:text-amber-800 dark:text-amber-400"
+                  >
+                    скачать example.bpmn
+                  </a>
+                </p>
                 <BpmnDropzone
                   file={bpmnFile}
                   onFile={setBpmnFile}

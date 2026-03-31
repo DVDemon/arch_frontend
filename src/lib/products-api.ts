@@ -165,6 +165,42 @@ export async function uploadWorkspaceDsl(
   });
 }
 
+/**
+ * Конвертирует workspace.dsl в JSON через structurizr_backend.
+ * Возвращает JSON-строку, готовую для загрузки в graph API.
+ */
+export async function convertWorkspaceDslToJson(dslContent: string): Promise<string> {
+  const base64 = base64EncodeUtf8(dslContent);
+  const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8080";
+  const res = await fetch(`${API_BASE}${STRUCTURIZR_BASE}/api/v1/workspace/conversion`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ workspace: base64 }),
+  });
+  const text = await res.text();
+  if (!res.ok) {
+    let message = text || res.statusText;
+    try {
+      const j = JSON.parse(text) as { detail?: unknown; error?: unknown };
+      const candidate = (typeof j.detail === "object" && j.detail && "error" in j.detail)
+        ? (j.detail as { error?: unknown }).error
+        : j.detail ?? j.error;
+      if (typeof candidate === "string") message = candidate;
+      else if (candidate != null) message = JSON.stringify(candidate);
+    } catch {
+      // keep raw message
+    }
+    throw new Error(`Ошибка конвертации DSL ${res.status}: ${message}`);
+  }
+  if (!text) throw new Error("Пустой ответ conversion");
+  try {
+    const parsed = JSON.parse(text);
+    return JSON.stringify(parsed);
+  } catch {
+    throw new Error("Conversion вернул невалидный JSON");
+  }
+}
+
 /** Ответ POST /api/v1/workspace (Structurizr On-Premises). */
 export interface StructurizrWorkspaceCreated {
   id: number;

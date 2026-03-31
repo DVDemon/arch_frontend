@@ -11,10 +11,12 @@ import {
   getProductFitnessFunctions,
   updateProduct,
   uploadWorkspaceDsl,
+  convertWorkspaceDslToJson,
   patchProductWorkspace,
   createStructurizrWorkspace,
 } from "@/lib/products-api";
 import type { ProductTechCapability } from "@/lib/products-api";
+import { uploadGraphGlobal, uploadGraphLocal } from "@/lib/graph-api";
 import { getTechList } from "@/lib/techradar-api";
 import type {
   ProductFull,
@@ -562,6 +564,13 @@ function DslUploadBlock({
   const [uploading, setUploading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [successPopup, setSuccessPopup] = useState(false);
+  const [stage, setStage] = useState<string>("");
+  const [stageLog, setStageLog] = useState<string[]>([]);
+
+  const logStage = useCallback((message: string) => {
+    setStage(message);
+    setStageLog((prev) => [...prev, message]);
+  }, []);
 
   const handleFileChange = useCallback(
     async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -570,21 +579,41 @@ function DslUploadBlock({
       setError(null);
       setSuccessPopup(false);
       setUploading(true);
+      setStage("");
+      setStageLog([]);
+      const runLog: string[] = [];
+      const log = (message: string) => {
+        runLog.push(message);
+        logStage(message);
+      };
       try {
+        log("1/5 Импорт DSL в FDM...");
         const text = await file.text();
         await uploadWorkspaceDsl(productAlias, text);
+        log("2/5 Конвертация DSL → JSON...");
+        const workspaceJson = await convertWorkspaceDslToJson(text);
+        log("3/5 Загрузка JSON в локальный граф...");
+        await uploadGraphLocal(workspaceJson);
+        log("4/5 Загрузка JSON в глобальный граф...");
+        await uploadGraphGlobal(workspaceJson);
+        log("5/5 Обновление данных карточки продукта...");
         onSuccess();
+        log("Готово: DSL импортирован, графы (local/global) обновлены.");
         setSuccessPopup(true);
       } catch (e) {
         const msg =
           e instanceof Error ? e.message : "Ошибка загрузки workspace.dsl";
-        setError(msg);
+        const details = runLog.length
+          ? `\n\nЭтапы:\n- ${runLog.join("\n- ")}`
+          : "";
+        setError(`${msg}${details}`);
       } finally {
         setUploading(false);
+        setStage("");
         e.target.value = "";
       }
     },
-    [productAlias, onSuccess]
+    [productAlias, onSuccess, logStage]
   );
 
   return (
@@ -595,6 +624,16 @@ function DslUploadBlock({
       <p className="text-sm text-zinc-600 dark:text-zinc-400">
         Загрузите файл workspace.dsl для импорта в FDM. Операция может занять
         несколько минут.
+      </p>
+      <p className="text-xs text-zinc-500 dark:text-zinc-400">
+        Пример файла:{" "}
+        <a
+          href="/workspace.dsl"
+          download="workspace.dsl"
+          className="text-amber-700 underline hover:text-amber-800 dark:text-amber-400"
+        >
+          скачать workspace.dsl
+        </a>
       </p>
       <div className="flex flex-wrap items-center gap-3">
         <input
@@ -627,12 +666,22 @@ function DslUploadBlock({
                 d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
               />
             </svg>
-            <span>Обработка…</span>
+            <span>{stage || "Обработка…"}</span>
           </div>
         )}
       </div>
+      {stageLog.length > 0 && (
+        <div className="rounded-lg border border-zinc-200 bg-white p-3 text-xs text-zinc-600 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300">
+          <p className="mb-2 font-medium">Статус загрузки</p>
+          <ul className="space-y-1">
+            {stageLog.map((entry, idx) => (
+              <li key={`${idx}-${entry}`}>• {entry}</li>
+            ))}
+          </ul>
+        </div>
+      )}
       {error && (
-        <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700 dark:border-red-800 dark:bg-red-900/20 dark:text-red-300">
+        <div className="whitespace-pre-wrap rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700 dark:border-red-800 dark:bg-red-900/20 dark:text-red-300">
           {error}
         </div>
       )}
@@ -652,7 +701,7 @@ function DslUploadBlock({
               Загрузка завершена
             </h3>
             <p className="mb-4 text-zinc-600 dark:text-zinc-400">
-              workspace.dsl успешно импортирован. Данные продукта обновлены.
+              workspace.dsl успешно импортирован. JSON загружен в локальный и глобальный графы. Данные продукта обновлены.
             </p>
             <button
               type="button"
