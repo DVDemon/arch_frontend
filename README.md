@@ -11,7 +11,8 @@ BeeAtlas Lite — это Next.js приложение, которое подкл
 - строить контекстные диаграммы и выполнять CYPHER-запросы к Neo4j;
 - загружать `workspace.dsl` (Structurizr DSL) в FDM: импорт контейнеров, проверки архитектуры (fitness functions) и технических возможностей;
 - просматривать результаты проверок архитектуры (последняя оценка по продукту);
-- просматривать технические возможности продукта из контейнеров и интерфейсов.
+- просматривать технические возможности продукта из контейнеров и интерфейсов;
+- работать с CX-сценариями (CJ/BI): CRUD, импорт BPMN, просмотр шагов и редактирование связей технической реализации по шагам BI.
 
 ## Структура сервисов (docker-compose)
 
@@ -110,6 +111,8 @@ npm run dev
 |------------|----------|--------------|
 | `API_URL` | URL Gateway для серверных запросов (из контейнера) | `http://gateway:8080` |
 | `NEXT_PUBLIC_API_URL` | URL Gateway для браузера | `http://localhost:8080` |
+| `NEXT_PUBLIC_USER_ID` | user-id для запросов к gateway без JWT (локальная разработка) | не задан |
+| `NEXT_PUBLIC_USER_ROLES` | user-roles для запросов без JWT (напр. `ADMINISTRATOR`) | не задан |
 | `BEEATLAS_FRONTEND_PORT` | Порт frontend на хосте | `3000` |
 
 ### Другие сервисы
@@ -144,6 +147,8 @@ npm run dev
 | `/products` | Каталог продуктов (CRUD, фильтр, сортировка) |
 | `/products/[alias]` | Карточка продукта с вкладками: **Информация** (редактирование, Structurizr, загрузка `workspace.dsl`), **Технологии**, **Пользователи**, **Контейнеры**, **Проверки архитектуры** (fitness, HTML-результаты), **Context** (диаграммы), **Технические возможности** (из контейнеров/интерфейсов) |
 | `/capabilities` | Каталог возможностей: дерево бизнес/техвозможностей, поиск, детали |
+| `/cx` | Каталог CX: вкладки CJ/BI, фильтры, сортировка, CRUD |
+| `/cx/[id]` | Карточка CJ: сводка, переключатель draft, интерактивная BPMN-диаграмма (bpmn.io), импорт BPMN, версии BPMN, шаги CJ и детальный просмотр BI/шагов BI |
 | `/tech-radar` | Технологический радар: визуализация по кольцам и секторам |
 | `/tech-radar/edit` | Редактирование технологий: CRUD, версии, статусы |
 | `/architecture` | Архитектура: загрузка JSON, контекстные диаграммы, CYPHER-запросы |
@@ -166,6 +171,35 @@ npm run dev
 | GET | `/product/{alias}/container` | Контейнеры с интерфейсами и операциями (включая TC) |
 | GET | `/product/{alias}/fitness-function` | Результаты проверок архитектуры (последняя оценка; опционально `source_type`, `source_id`). Поле `resultDetails` — HTML |
 | GET | `/product/implemented/container/tech-capability` | Техвозможности по контейнерам |
+| GET | `/product/by-ids?ids=` | Продукты по списку ID (используется в карточке CJ для ссылки на продукт) |
+
+#### CX (`/api-gateway/cx/v1`, `/api-gateway/cx/v2`, `/cx/api/cx`)
+
+| Метод | Путь | Описание |
+|-------|------|----------|
+| GET | `/api-gateway/cx/v1/cj?sample=...&search=...` | Список CJ (совместимость) |
+| GET | `/cx/api/cx/v2/product/cj` | Список CJ v2 |
+| POST | `/cx/api/cx/v1/product/{productId}/cj` | Создание CJ |
+| PATCH | `/cx/api/cx/v1/product/cj/{id}` | Редактирование CJ (в т.ч. draft/tags) |
+| DELETE | `/cx/api/cx/v1/product/cj/{id}` | Удаление CJ |
+| GET | `/cx/api/cx/v2/product/cj/{id}` | Детальная карточка CJ (шаги + BI) |
+| POST | `/cx/api/cx/v1/bpmn/cj/{id}` | Импорт BPMN в пустую структуру CJ |
+| PATCH | `/cx/api/cx/v1/bpmn/cj/{id}` | Обновление структуры CJ из BPMN |
+| GET | `/cx/api/cx/v1/library/business-interactions` | Список BI |
+| POST | `/cx/api/cx/v1/library/business-interactions` | Создание BI |
+| PATCH | `/cx/api/cx/v1/library/business-interactions/{id}` | Редактирование BI |
+| DELETE | `/cx/api/cx/v1/library/business-interactions/{id}` | Удаление BI |
+| PATCH | `/cx/api/cx/v1/library/business-interactions/step/{id}` | Обновление НФТ шага BI (`latency/errorRate/rps`) |
+| PUT | `/cx/api/cx/v1/library/business-interactions/step/{id}/relation` | Привязка техреализации к шагу BI (`tcId/interfaceId/operationId`) |
+
+#### Documents (`/api-gateway/document/v1`)
+
+| Метод | Путь | Описание |
+|-------|------|----------|
+| GET | `/documentations/{entity-type}` | Типы документации (для CJ используется BPMN-тип) |
+| POST | `/documents/CJ_BPMN/bpmn?targetId={cjId}` | Загрузка BPMN файла для CJ |
+| GET | `/documents/versions/{documentationTypeId}/{targetId}` | История версий BPMN |
+| GET | `/documents/{documentationTypeId}/{targetId}` | Получение/скачивание актуального BPMN |
 
 #### Structurizr Backend (`/structurizr-backend`)
 
@@ -221,6 +255,7 @@ Next.js проксирует запросы к `architect-graph-service` для 
 - **Tailwind CSS 4**
 - **@hpcc-js/wasm** — рендеринг DOT-диаграмм
 - **react-force-graph-2d** — визуализация графов
+- **bpmn-js (bpmn.io)** — интерактивный просмотр BPMN в карточке CJ
 
 ## Лицензия
 
