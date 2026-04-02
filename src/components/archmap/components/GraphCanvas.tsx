@@ -8,7 +8,12 @@ import {
   useImperativeHandle,
 } from 'react';
 import type { Simulation } from 'd3-force';
-import { graphEdgeLabel, type C4Node, type GraphEdge } from '../types/c4';
+import {
+  graphEdgeLabel,
+  isStructuralEdgeRelationship,
+  type C4Node,
+  type GraphEdge,
+} from '../types/c4';
 import { C4_COLORS } from '../types/c4';
 import { createForceSimulation, type GraphLink, type SimNode } from '../lib/forceGraphLayout';
 import {
@@ -16,11 +21,14 @@ import {
   GRID_CELL,
   labelPointAlongPolyline,
   routeEdgeWithAStar,
+  snapSizeToGrid,
   type LayoutBox,
   type Point,
 } from '../lib/astarGridRouter';
-import { buildDiagramSvgString } from '../lib/graphExportSvg';
+import { buildDiagramSvgString, type ClusterExportForSvg } from '../lib/graphExportSvg';
 import { computeDiagramBounds } from '../lib/graphDiagramBounds';
+import { getDiagramPalette, type DiagramPalette } from '../lib/diagramTheme';
+import { useTheme } from '@/components/ThemeProvider';
 
 interface GraphCanvasProps {
   nodes: C4Node[];
@@ -38,6 +46,8 @@ interface GraphCanvasProps {
 export interface GraphCanvasHandle {
   exportPng: () => void;
   exportSvg: () => void;
+  /** Узлы с координатами, рёбра, маршруты линий и подписи — для скриптов и внешних инструментов. */
+  exportJson: () => void;
   zoomIn: () => void;
   zoomOut: () => void;
   resetZoom: () => void;
@@ -106,11 +116,10 @@ function edgeStartsHorizontal(src: LayoutNode, tgt: LayoutNode): boolean {
   return src.node.labels.length === 1 || tgt.node.labels.length === 1;
 }
 
-/** Белая «обводка» + серая линия: связь читается поверх заливки карточек (#FFF). */
-const EDGE_HALO_COLOR = '#FFFFFF';
 const EDGE_HALO_WIDTH = 4;
-const EDGE_STROKE_COLOR = '#BBBBBB';
 const EDGE_STROKE_WIDTH = 1.35;
+/** Пунктир для Child / Deploy (короткий штрих + зазор ≈ «точки» при round cap). */
+const EDGE_DOT_DASH: number[] = [2, 6];
 
 function tracePolylinePath(ctx: CanvasRenderingContext2D, points: Point[]): void {
   if (points.length === 0) return;
@@ -120,20 +129,63 @@ function tracePolylinePath(ctx: CanvasRenderingContext2D, points: Point[]): void
   }
 }
 
-function strokePolylineOverNodes(ctx: CanvasRenderingContext2D, points: Point[]): void {
+function simplifyPolylinePoints(points: Point[], stride: number): Point[] {
+  if (stride <= 1 || points.length <= 3) return points;
+  const out: Point[] = [points[0]!];
+  for (let i = 1; i < points.length - 1; i++) {
+    if (i % stride === 0) out.push(points[i]!);
+  }
+  out.push(points[points.length - 1]!);
+  return out;
+}
+
+function traceSplinePath(
+  ctx: CanvasRenderingContext2D,
+  points: Point[],
+  options?: { lowQuality?: boolean }
+): void {
+  if (points.length === 0) return;
+  if (points.length < 3) {
+    tracePolylinePath(ctx, points);
+    return;
+  }
+  const work = options?.lowQuality ? simplifyPolylinePoints(points, 2) : points;
+  ctx.moveTo(work[0]!.x, work[0]!.y);
+  for (let i = 1; i < work.length - 1; i++) {
+    const p = work[i]!;
+    const n = work[i + 1]!;
+    const mx = (p.x + n.x) / 2;
+    const my = (p.y + n.y) / 2;
+    ctx.quadraticCurveTo(p.x, p.y, mx, my);
+  }
+  const penultimate = work[work.length - 2]!;
+  const last = work[work.length - 1]!;
+  ctx.quadraticCurveTo(penultimate.x, penultimate.y, last.x, last.y);
+}
+
+function strokeSplineOverNodes(
+  ctx: CanvasRenderingContext2D,
+  points: Point[],
+  options?: { lowQuality?: boolean; dotted?: boolean; palette: DiagramPalette }
+): void {
   if (points.length < 2) return;
+  const pal = options?.palette;
+  if (!pal) return;
+  const dash = options?.dotted ? EDGE_DOT_DASH : [];
   ctx.lineCap = 'round';
   ctx.lineJoin = 'round';
+  ctx.setLineDash(dash);
   ctx.beginPath();
-  tracePolylinePath(ctx, points);
-  ctx.strokeStyle = EDGE_HALO_COLOR;
+  traceSplinePath(ctx, points, options);
+  ctx.strokeStyle = pal.edgeHalo;
   ctx.lineWidth = EDGE_HALO_WIDTH;
   ctx.stroke();
   ctx.beginPath();
-  tracePolylinePath(ctx, points);
-  ctx.strokeStyle = EDGE_STROKE_COLOR;
+  traceSplinePath(ctx, points, options);
+  ctx.strokeStyle = pal.edgeStroke;
   ctx.lineWidth = EDGE_STROKE_WIDTH;
   ctx.stroke();
+  ctx.setLineDash([]);
 }
 
 interface EdgeLabelGeom {
@@ -147,19 +199,25 @@ interface GeometryCache {
   layoutVersion: number;
   focusId: string | null;
   edgePolylines: Point[][];
+  /** true = пунктир (Child / Deploy) — индекс совпадает с edgePolylines */
+  edgeDotted: boolean[];
   placedLabels: EdgeLabelGeom[];
 }
 
-const FAST_MODE_NODE_THRESHOLD = 70;
-const FAST_MODE_EDGE_THRESHOLD = 120;
+// Оптимизация отрисовки диаграммы по скорости.
+// <50: лучшее качество; 50..100: средняя оптимизация; >100: максимальная оптимизация.
+const SPEED_OPT_MEDIUM_NODE_THRESHOLD = 50;
+const SPEED_OPT_STRONG_NODE_THRESHOLD = 100;
 const PROGRESSIVE_EDGE_CHUNK_SIZE = 5;
 const PROGRESSIVE_EDGE_BUDGET_MS = 8;
-const SOFTWARE_SYSTEM_STRAIGHT_EDGE_THRESHOLD = 20;
+const HEAVY_MODE_MAX_TICKS = 55;
 const CLUSTER_MIN_SIZE = 5;
 const CLUSTER_MEMBER_W = 120;
 const CLUSTER_MEMBER_H = 48;
 const CLUSTER_HEADER_H = 24;
+/** Один шаг сетки от границы группы до внутренних мини-карточек (со всех сторон). */
 const CLUSTER_BOX_PADDING = GRID_CELL;
+const LOW_QUALITY_SPLINE_EDGE_THRESHOLD = 100;
 
 function nodeMainLabel(node: C4Node): string {
   return getMainLabel(node.labels);
@@ -182,16 +240,16 @@ function dedupeEdges(edges: GraphEdge[]): GraphEdge[] {
 }
 
 function clusterDimensions(memberCount: number): { width: number; height: number } {
+  const pad = CLUSTER_BOX_PADDING;
   const cols = Math.ceil(Math.sqrt(memberCount));
   const rows = Math.ceil(memberCount / cols);
   const innerW =
     cols * CLUSTER_MEMBER_W + Math.max(0, cols - 1) * GRID_CELL;
   const innerH =
     rows * CLUSTER_MEMBER_H + Math.max(0, rows - 1) * GRID_CELL;
-  let width = CLUSTER_BOX_PADDING * 2 + innerW;
-  const height = CLUSTER_BOX_PADDING * 2 + CLUSTER_HEADER_H + innerH;
-  width = Math.max(width, height * 2); // 4:2 ratio
-  return { width, height };
+  const width = pad * 2 + innerW;
+  const height = pad * 2 + CLUSTER_HEADER_H + innerH;
+  return { width: snapSizeToGrid(width), height: snapSizeToGrid(height) };
 }
 
 function collapseDenseSimilarNodes(
@@ -207,7 +265,15 @@ function collapseDenseSimilarNodes(
   if (!selectedNodeId) {
     return { nodes, edges, clusters: new Map(), selectedVisibleId: null };
   }
-  const eligibleTypes = new Set(['Container', 'SoftwareSystem', 'Component']);
+  // Кластеры строим только для "осмысленных" типов узлов.
+  // В UI "Instance" соответствует `ContainerInstance`.
+  const eligibleTypes = new Set([
+    'Container',
+    'SoftwareSystem',
+    'Component',
+    'ContainerInstance',
+    'DeploymentNode',
+  ]);
   const byId = new Map(nodes.map((n) => [n.id, n]));
   const candidates = new Map<
     string,
@@ -215,10 +281,11 @@ function collapseDenseSimilarNodes(
   >();
 
   edges.forEach((edge) => {
-    const label = graphEdgeLabel(edge).trim();
+    const rawLabel = graphEdgeLabel(edge).trim();
+    const label = rawLabel.length > 0 ? rawLabel : '(no-label)';
     const src = byId.get(edge.source);
     const tgt = byId.get(edge.target);
-    if (!src || !tgt || !label) return;
+    if (!src || !tgt) return;
     const addCandidate = (member: C4Node) => {
       if (member.id === selectedNodeId) return;
       const memberType = nodeMainLabel(member);
@@ -264,12 +331,12 @@ function collapseDenseSimilarNodes(
       id: clusterId,
       labels: [g.memberType, 'ClusterGroup'],
       name: `${g.memberType} x${members.length}`,
-      technology: g.edgeLabel,
+      technology: g.edgeLabel === '(no-label)' ? undefined : g.edgeLabel,
       properties: {
         __cluster: true,
         __clusterType: g.memberType,
         __clusterSize: members.length,
-        __clusterEdgeLabel: g.edgeLabel,
+        __clusterEdgeLabel: g.edgeLabel === '(no-label)' ? '' : g.edgeLabel,
         __clusterWidth: dim.width,
         __clusterHeight: dim.height,
       },
@@ -424,7 +491,8 @@ function roundRectPath(
 function drawTagBadge(
   ctx: CanvasRenderingContext2D,
   ln: LayoutNode,
-  count: number
+  count: number,
+  palette: DiagramPalette
 ): void {
   if (count <= 0) return;
   const pad = 4;
@@ -437,8 +505,8 @@ function drawTagBadge(
   const rx = ln.x + ln.width - badgeW - pad;
   const ry = ln.y + pad;
 
-  ctx.fillStyle = '#FFF3E0';
-  ctx.strokeStyle = '#E65100';
+  ctx.fillStyle = palette.badgeFill;
+  ctx.strokeStyle = palette.badgeStroke;
   ctx.lineWidth = 1;
   roundRectPath(ctx, rx, ry, badgeW, badgeH, 4);
   ctx.fill();
@@ -451,17 +519,17 @@ function drawTagBadge(
   ctx.lineTo(tx + 4, ty + 3);
   ctx.lineTo(tx - 4, ty + 3);
   ctx.closePath();
-  ctx.fillStyle = '#E65100';
+  ctx.fillStyle = palette.badgeIcon;
   ctx.fill();
 
-  ctx.fillStyle = '#BF360C';
+  ctx.fillStyle = palette.badgeText;
   ctx.textAlign = 'left';
   ctx.textBaseline = 'middle';
   ctx.font = 'bold 10px "JetBrains Mono", monospace';
   ctx.fillText(countStr, rx + iconSlot + 2, ry + badgeH / 2);
 }
 
-function drawEdgeLabelPill(ctx: CanvasRenderingContext2D, g: EdgeLabelGeom) {
+function drawEdgeLabelPill(ctx: CanvasRenderingContext2D, g: EdgeLabelGeom, palette: DiagramPalette) {
   ctx.font = EDGE_LABEL_FONT;
   const m = ctx.measureText(g.text);
   const w = m.width;
@@ -474,14 +542,14 @@ function drawEdgeLabelPill(ctx: CanvasRenderingContext2D, g: EdgeLabelGeom) {
   const rw = w + pad * 2;
   const rh = EDGE_LABEL_LINE + pad * 2;
 
-  ctx.fillStyle = 'rgba(250, 250, 250, 0.95)';
+  ctx.fillStyle = palette.edgeLabelBg;
   roundRectPath(ctx, rx, ry, rw, rh, 4);
   ctx.fill();
-  ctx.strokeStyle = 'rgba(180, 180, 180, 0.95)';
+  ctx.strokeStyle = palette.edgeLabelBorder;
   ctx.lineWidth = 1;
   ctx.stroke();
 
-  ctx.fillStyle = '#444444';
+  ctx.fillStyle = palette.edgeLabelText;
   ctx.textBaseline = 'alphabetic';
   ctx.textAlign = g.align;
   ctx.fillText(g.text, g.x, g.y);
@@ -491,7 +559,7 @@ function buildEdgeGeometry(
   layout: LayoutNode[],
   edges: GraphEdge[],
   focusId: string | null | undefined
-): { edgePolylines: Point[][]; labelCandidates: EdgeLabelGeom[] } {
+): { edgePolylines: Point[][]; edgeDotted: boolean[]; labelCandidates: EdgeLabelGeom[] } {
   const nodeMap = new Map(layout.map((ln) => [ln.node.id, ln]));
   const layoutBoxes: LayoutBox[] = layout.map((ln) => ({
     id: ln.node.id,
@@ -501,6 +569,7 @@ function buildEdgeGeometry(
     height: ln.height,
   }));
   const edgePolylines: Point[][] = [];
+  const edgeDotted: boolean[] = [];
   const labelCandidates: EdgeLabelGeom[] = [];
   const seen = new Set<string>();
 
@@ -536,6 +605,7 @@ function buildEdgeGeometry(
     const horizontalFirst = edgeStartsHorizontal(src, tgt);
     const points = routeEdgeWithAStar(srcBox, tgtBox, layoutBoxes, horizontalFirst);
     edgePolylines.push(points);
+    edgeDotted.push(isStructuralEdgeRelationship(edge.type));
 
     if (labelText) {
       const bias = labelBiasEnd(focusId, edge.source, edge.target);
@@ -549,7 +619,7 @@ function buildEdgeGeometry(
     }
   });
 
-  return { edgePolylines, labelCandidates };
+  return { edgePolylines, edgeDotted, labelCandidates };
 }
 
 function rectBoundaryPointToward(from: LayoutNode, toX: number, toY: number): Point {
@@ -570,9 +640,10 @@ function buildEdgeGeometryStraight(
   layout: LayoutNode[],
   edges: GraphEdge[],
   focusId: string | null | undefined
-): { edgePolylines: Point[][]; labelCandidates: EdgeLabelGeom[] } {
+): { edgePolylines: Point[][]; edgeDotted: boolean[]; labelCandidates: EdgeLabelGeom[] } {
   const nodeMap = new Map(layout.map((ln) => [ln.node.id, ln]));
   const edgePolylines: Point[][] = [];
+  const edgeDotted: boolean[] = [];
   const labelCandidates: EdgeLabelGeom[] = [];
 
   edges.forEach((edge) => {
@@ -585,6 +656,7 @@ function buildEdgeGeometryStraight(
     const p2 = rectBoundaryPointToward(tgt, srcC.x, srcC.y);
     const points = [p1, p2];
     edgePolylines.push(points);
+    edgeDotted.push(isStructuralEdgeRelationship(edge.type));
 
     const labelText = graphEdgeLabel(edge);
     if (labelText) {
@@ -599,7 +671,44 @@ function buildEdgeGeometryStraight(
     }
   });
 
-  return { edgePolylines, labelCandidates };
+  return { edgePolylines, edgeDotted, labelCandidates };
+}
+
+/** Внутренние мини-карточки группы — отдельным проходом поверх рёбер, иначе линии перекрывают ячейки. */
+function paintClusterInnerMiniCards(
+  ctx: CanvasRenderingContext2D,
+  layout: LayoutNode[],
+  clusterMetaById: ReadonlyMap<string, ClusterMeta>,
+  palette: DiagramPalette
+): void {
+  layout.forEach((ln) => {
+    const clusterMeta = clusterMetaById.get(ln.node.id);
+    if (!clusterMeta || !isClusterNode(ln.node)) return;
+    const mainLabel = getMainLabel(ln.node.labels);
+    const color = C4_COLORS[mainLabel] || '#777';
+    const cols = Math.ceil(Math.sqrt(clusterMeta.members.length));
+    const innerStartX = ln.x + CLUSTER_BOX_PADDING;
+    const innerStartY = ln.y + CLUSTER_BOX_PADDING + CLUSTER_HEADER_H;
+    ctx.save();
+    clusterMeta.members.forEach((member, idx) => {
+      const col = idx % cols;
+      const row = Math.floor(idx / cols);
+      const mx = innerStartX + col * (CLUSTER_MEMBER_W + GRID_CELL);
+      const my = innerStartY + row * (CLUSTER_MEMBER_H + GRID_CELL);
+      ctx.fillStyle = palette.clusterInnerFill;
+      ctx.strokeStyle = palette.clusterInnerBorder;
+      ctx.lineWidth = 1;
+      ctx.fillRect(mx, my, CLUSTER_MEMBER_W, CLUSTER_MEMBER_H);
+      ctx.strokeRect(mx, my, CLUSTER_MEMBER_W, CLUSTER_MEMBER_H);
+      ctx.fillStyle = color;
+      ctx.font = '10px "JetBrains Mono", monospace';
+      ctx.textAlign = 'left';
+      const shortName =
+        member.name.length > 14 ? `${member.name.slice(0, 12)}...` : member.name;
+      ctx.fillText(shortName, mx + 8, my + 22);
+    });
+    ctx.restore();
+  });
 }
 
 function paintDiagramNodes(
@@ -607,7 +716,8 @@ function paintDiagramNodes(
   layout: LayoutNode[],
   sel: string | null,
   tagCountByNodeId: ReadonlyMap<string, number>,
-  clusterMetaById: ReadonlyMap<string, ClusterMeta>
+  clusterMetaById: ReadonlyMap<string, ClusterMeta>,
+  palette: DiagramPalette
 ): void {
   layout.forEach((ln) => {
     const mainLabel = getMainLabel(ln.node.labels);
@@ -618,14 +728,14 @@ function paintDiagramNodes(
 
     if (clusterMeta && isClusterNode(ln.node)) {
       ctx.save();
-      ctx.fillStyle = '#FFFFFF';
+      ctx.fillStyle = palette.cardFill;
       ctx.fillRect(ln.x, ln.y, ln.width, ln.height);
 
       if (isSelected) {
         ctx.strokeStyle = color;
         ctx.lineWidth = 2;
       } else {
-        ctx.strokeStyle = '#9E9E9E';
+        ctx.strokeStyle = palette.clusterOuterBorder;
         ctx.lineWidth = 1.5;
       }
       ctx.setLineDash([8, 6]);
@@ -636,40 +746,21 @@ function paintDiagramNodes(
       const edgeLabel = typeof p.__clusterEdgeLabel === 'string' ? p.__clusterEdgeLabel : '';
       ctx.fillStyle = color;
       ctx.font = 'bold 10px "JetBrains Mono", monospace';
+      ctx.textAlign = 'left';
       ctx.fillText(`[GROUP ${clusterMeta.memberType.toUpperCase()}]`, ln.x + 10, ln.y + 15);
-      ctx.fillStyle = '#666666';
+      ctx.fillStyle = palette.clusterTitleMuted;
       ctx.font = '10px "JetBrains Mono", monospace';
       const title = `${clusterMeta.members.length} nodes${edgeLabel ? ` | ${edgeLabel}` : ''}`;
       ctx.fillText(title, ln.x + 10, ln.y + 28);
-
-      const cols = Math.ceil(Math.sqrt(clusterMeta.members.length));
-      const innerStartX = ln.x + CLUSTER_BOX_PADDING;
-      const innerStartY = ln.y + CLUSTER_BOX_PADDING + CLUSTER_HEADER_H;
-      clusterMeta.members.forEach((member, idx) => {
-        const col = idx % cols;
-        const row = Math.floor(idx / cols);
-        const mx = innerStartX + col * (CLUSTER_MEMBER_W + GRID_CELL);
-        const my = innerStartY + row * (CLUSTER_MEMBER_H + GRID_CELL);
-        ctx.fillStyle = '#FDFDFD';
-        ctx.strokeStyle = '#D0D0D0';
-        ctx.lineWidth = 1;
-        ctx.fillRect(mx, my, CLUSTER_MEMBER_W, CLUSTER_MEMBER_H);
-        ctx.strokeRect(mx, my, CLUSTER_MEMBER_W, CLUSTER_MEMBER_H);
-        ctx.fillStyle = color;
-        ctx.font = '10px "JetBrains Mono", monospace';
-        const shortName =
-          member.name.length > 14 ? `${member.name.slice(0, 12)}...` : member.name;
-        ctx.fillText(shortName, mx + 8, my + 22);
-      });
       ctx.restore();
       return;
     }
 
-    ctx.fillStyle = '#FFFFFF';
+    ctx.fillStyle = palette.cardFill;
     ctx.fillRect(ln.x, ln.y, ln.width, ln.height);
 
     if (tagCount > 0) {
-      ctx.fillStyle = '#FFB74D';
+      ctx.fillStyle = palette.tagStrip;
       ctx.fillRect(ln.x, ln.y, ln.width, 3);
     }
 
@@ -683,7 +774,7 @@ function paintDiagramNodes(
       ctx.restore();
     }
 
-    ctx.strokeStyle = isSelected ? color : '#E0E0E0';
+    ctx.strokeStyle = isSelected ? color : palette.cardBorder;
     ctx.lineWidth = isSelected ? 2 : 1;
     ctx.strokeRect(ln.x, ln.y, ln.width, ln.height);
 
@@ -696,14 +787,14 @@ function paintDiagramNodes(
     ctx.fillText(`[${getLabelDisplay(mainLabel)}]`, ln.x + 12, ln.y + 18);
 
     ctx.font = '12px "JetBrains Mono", monospace';
-    ctx.fillStyle = '#000000';
+    ctx.fillStyle = palette.textPrimary;
     const name =
       ln.node.name.length > 22 ? ln.node.name.slice(0, 20) + '...' : ln.node.name;
     ctx.fillText(name, ln.x + 12, ln.y + 38);
 
     if (ln.node.technology) {
       ctx.font = '10px "JetBrains Mono", monospace';
-      ctx.fillStyle = '#888888';
+      ctx.fillStyle = palette.textSecondary;
       const tech =
         ln.node.technology.length > 26
           ? ln.node.technology.slice(0, 24) + '...'
@@ -711,13 +802,40 @@ function paintDiagramNodes(
       ctx.fillText(tech, ln.x + 12, ln.y + 56);
     }
 
-    drawTagBadge(ctx, ln, tagCount);
+    drawTagBadge(ctx, ln, tagCount, palette);
   });
 }
 
-function paintDiagramEdges(ctx: CanvasRenderingContext2D, edgePolylines: Point[][]): void {
-  edgePolylines.forEach((points) => {
-    strokePolylineOverNodes(ctx, points);
+function paintDiagramEdges(
+  ctx: CanvasRenderingContext2D,
+  edgePolylines: Point[][],
+  options?: {
+    hideHalo?: boolean;
+    lowQuality?: boolean;
+    edgeDotted?: boolean[];
+    palette: DiagramPalette;
+  }
+): void {
+  const palette = options?.palette;
+  if (!palette) return;
+  const lowQuality =
+    options?.lowQuality ?? edgePolylines.length >= LOW_QUALITY_SPLINE_EDGE_THRESHOLD;
+  const dottedFlags = options?.edgeDotted;
+  edgePolylines.forEach((points, i) => {
+    const dotted = dottedFlags?.[i] ?? false;
+    if (options?.hideHalo) {
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      ctx.setLineDash(dotted ? EDGE_DOT_DASH : []);
+      ctx.beginPath();
+      traceSplinePath(ctx, points, { lowQuality });
+      ctx.strokeStyle = palette.edgeStroke;
+      ctx.lineWidth = EDGE_STROKE_WIDTH;
+      ctx.stroke();
+      ctx.setLineDash([]);
+    } else {
+      strokeSplineOverNodes(ctx, points, { lowQuality, dotted, palette });
+    }
     if (points.length < 2) return;
     const angle = arrowAngleFromPolyline(points);
     const tx = points[points.length - 1]!.x;
@@ -727,7 +845,7 @@ function paintDiagramEdges(ctx: CanvasRenderingContext2D, edgePolylines: Point[]
     ctx.lineTo(tx - 8 * Math.cos(angle - 0.4), ty - 8 * Math.sin(angle - 0.4));
     ctx.lineTo(tx - 8 * Math.cos(angle + 0.4), ty - 8 * Math.sin(angle + 0.4));
     ctx.closePath();
-    ctx.fillStyle = EDGE_STROKE_COLOR;
+    ctx.fillStyle = palette.edgeStroke;
     ctx.fill();
   });
 }
@@ -760,10 +878,11 @@ function computeFullExportData(
 ): {
   bounds: { width: number; height: number; offsetX: number; offsetY: number };
   edgePolylines: Point[][];
+  edgeDotted: boolean[];
   placedLabels: EdgeLabelGeom[];
 } | null {
   if (layout.length === 0) return null;
-  const { edgePolylines, labelCandidates } = buildEdgeGeometry(layout, edges, focusId);
+  const { edgePolylines, edgeDotted, labelCandidates } = buildEdgeGeometry(layout, edges, focusId);
   const tmp = document.createElement('canvas');
   const ctx = tmp.getContext('2d');
   if (!ctx) return null;
@@ -775,7 +894,7 @@ function computeFullExportData(
     labelHints,
     EXPORT_PAD
   );
-  return { bounds, edgePolylines, placedLabels };
+  return { bounds, edgePolylines, edgeDotted, placedLabels };
 }
 
 export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function GraphCanvas(
@@ -791,6 +910,11 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
   },
   ref
 ) {
+  const { resolvedTheme } = useTheme();
+  const palette = useMemo(
+    () => getDiagramPalette(resolvedTheme === 'dark'),
+    [resolvedTheme]
+  );
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const layoutRef = useRef<LayoutNode[]>([]);
   const collapsedGraph = useMemo(
@@ -814,6 +938,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
   const layoutVersionRef = useRef(0);
   const geometryCacheRef = useRef<GeometryCache | null>(null);
   const fastModeRef = useRef(false);
+  const heavyModeRef = useRef(false);
   const deferredFullGeometryReadyRef = useRef(false);
   const progressiveTimerRef = useRef<number | null>(null);
   const dragRef = useRef<{ dragging: boolean; lastX: number; lastY: number }>({
@@ -901,7 +1026,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
     canvas.height = rect.height * dpr;
     ctx.scale(dpr, dpr);
 
-    ctx.fillStyle = '#FAFAFA';
+    ctx.fillStyle = palette.canvasBg;
     ctx.fillRect(0, 0, rect.width, rect.height);
 
     const layout = simToLayout(simNodesRef.current);
@@ -916,6 +1041,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
     const sel = selectedIdRef.current;
     const focusId = focusIdRef.current;
     let edgePolylines: Point[][];
+    let edgeDotted: boolean[];
     let placedLabels: EdgeLabelGeom[];
     const cached = geometryCacheRef.current;
     if (
@@ -924,48 +1050,55 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
       cached.focusId === focusId
     ) {
       edgePolylines = cached.edgePolylines;
+      edgeDotted = cached.edgeDotted;
       placedLabels = cached.placedLabels;
     } else {
       const useFastGeometry = fastModeRef.current && !deferredFullGeometryReadyRef.current;
-      const selectedId = selectedIdRef.current;
-      const selectedNode = selectedId ? selectedNodeMapRef.current.get(selectedId) : undefined;
-      const selectedIsSoftwareSystem = Boolean(selectedNode?.labels.includes('SoftwareSystem'));
-      const connectedToSelected = selectedId
-        ? new Set(
-            visibleEdges
-              .filter((e) => e.source === selectedId || e.target === selectedId)
-              .map((e) => (e.source === selectedId ? e.target : e.source))
-          ).size
-        : 0;
-      const useStraightEdges =
-        selectedIsSoftwareSystem && connectedToSelected > SOFTWARE_SYSTEM_STRAIGHT_EDGE_THRESHOLD;
+      const heavyMode = heavyModeRef.current;
+      const useStraightEdges = heavyMode || fastModeRef.current;
 
-      const { edgePolylines: ep, labelCandidates } = useFastGeometry
-        ? { edgePolylines: [], labelCandidates: [] }
+      const { edgePolylines: ep, edgeDotted: ed, labelCandidates } = useFastGeometry
+        ? { edgePolylines: [], edgeDotted: [], labelCandidates: [] }
         : useStraightEdges
           ? buildEdgeGeometryStraight(layout, visibleEdges, focusId)
           : buildEdgeGeometry(layout, visibleEdges, focusId);
       const labelCtx = document.createElement('canvas').getContext('2d');
       placedLabels =
-        !useFastGeometry && labelCtx ? resolveEdgeLabelOverlaps(labelCtx, labelCandidates) : [];
+        !useFastGeometry && !heavyMode && labelCtx
+          ? resolveEdgeLabelOverlaps(labelCtx, labelCandidates)
+          : [];
       edgePolylines = ep;
+      edgeDotted = ed;
       geometryCacheRef.current = {
         layoutVersion: layoutVersionRef.current,
         focusId,
         edgePolylines,
+        edgeDotted,
         placedLabels,
       };
     }
 
-    paintDiagramNodes(ctx, layout, sel, tagCountRef.current, clusterMetaRef.current);
-    paintDiagramEdges(ctx, edgePolylines);
-    placedLabels.forEach((g) => drawEdgeLabelPill(ctx, g));
+    paintDiagramNodes(ctx, layout, sel, tagCountRef.current, clusterMetaRef.current, palette);
+    paintDiagramEdges(ctx, edgePolylines, {
+      hideHalo: heavyModeRef.current,
+      lowQuality: heavyModeRef.current || edgePolylines.length >= LOW_QUALITY_SPLINE_EDGE_THRESHOLD,
+      edgeDotted,
+      palette,
+    });
+    if (!heavyModeRef.current) {
+      placedLabels.forEach((g) => drawEdgeLabelPill(ctx, g, palette));
+    }
+    paintClusterInnerMiniCards(ctx, layout, clusterMetaRef.current, palette);
 
     ctx.restore();
-  }, [visibleEdges, simToLayout, focusNodeId]);
+  }, [visibleEdges, simToLayout, focusNodeId, palette]);
 
   const drawRef = useRef(draw);
   drawRef.current = draw;
+
+  useEffect(() => {
+    drawRef.current();
+  }, [palette]);
 
   useImperativeHandle(
     ref,
@@ -974,7 +1107,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
         const layout = simToLayout(simNodesRef.current);
         const data = computeFullExportData(layout, edgesRef.current, focusIdRef.current);
         if (!data) return;
-        const { bounds, edgePolylines, placedLabels } = data;
+        const { bounds, edgePolylines, edgeDotted, placedLabels } = data;
         if (bounds.width <= 0 || bounds.height <= 0) return;
 
         const dpr = window.devicePixelRatio || 1;
@@ -984,15 +1117,16 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
         const ctx = off.getContext('2d');
         if (!ctx) return;
         ctx.scale(dpr, dpr);
-        ctx.fillStyle = '#FAFAFA';
+        ctx.fillStyle = palette.canvasBg;
         ctx.fillRect(0, 0, bounds.width, bounds.height);
         ctx.save();
         ctx.translate(bounds.offsetX, bounds.offsetY);
 
         const sel = selectedIdRef.current;
-        paintDiagramNodes(ctx, layout, sel, tagCountRef.current, clusterMetaRef.current);
-        paintDiagramEdges(ctx, edgePolylines);
-        placedLabels.forEach((g) => drawEdgeLabelPill(ctx, g));
+        paintDiagramNodes(ctx, layout, sel, tagCountRef.current, clusterMetaRef.current, palette);
+        paintDiagramEdges(ctx, edgePolylines, { edgeDotted, palette });
+        placedLabels.forEach((g) => drawEdgeLabelPill(ctx, g, palette));
+        paintClusterInnerMiniCards(ctx, layout, clusterMetaRef.current, palette);
         ctx.restore();
 
         const a = document.createElement('a');
@@ -1004,7 +1138,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
         const layout = simToLayout(simNodesRef.current);
         const data = computeFullExportData(layout, edgesRef.current, focusIdRef.current);
         if (!data) return;
-        const { bounds, edgePolylines, placedLabels } = data;
+        const { bounds, edgePolylines, edgeDotted, placedLabels } = data;
 
         const layoutExport = layout.map((ln) => ({
           x: ln.x,
@@ -1022,6 +1156,15 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
           if (n > 0) tagCounts[id] = n;
         });
 
+        const clustersExport: Record<string, ClusterExportForSvg> = {};
+        clusterMetaRef.current.forEach((meta, id) => {
+          clustersExport[id] = {
+            memberType: meta.memberType,
+            edgeLabel: meta.edgeLabel,
+            members: meta.members.map((m) => ({ name: m.name })),
+          };
+        });
+
         const svg = buildDiagramSvgString({
           width: bounds.width,
           height: bounds.height,
@@ -1029,6 +1172,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
           panY: bounds.offsetY,
           layout: layoutExport,
           edgePolylines: edgePolylines.map((p) => p.map((q) => ({ ...q }))),
+          edgeDotted,
           edgeLabels: placedLabels.map((g) => ({
             text: g.text,
             x: g.x,
@@ -1037,12 +1181,65 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
           })),
           selectedId: selectedIdRef.current,
           tagCounts,
+          palette,
+          clusters: clustersExport,
         });
         const blob = new Blob([svg], { type: 'image/svg+xml;charset=utf-8' });
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;
         a.download = 'archmap-diagram.svg';
+        a.click();
+        URL.revokeObjectURL(url);
+      },
+      exportJson: () => {
+        const layout = simToLayout(simNodesRef.current);
+        const data = computeFullExportData(layout, edgesRef.current, focusIdRef.current);
+        if (!data) return;
+        const { bounds, edgePolylines, edgeDotted, placedLabels } = data;
+        const tagCounts: Record<string, number> = {};
+        tagCountRef.current.forEach((n, id) => {
+          if (n > 0) tagCounts[id] = n;
+        });
+        const payload = {
+          version: 1 as const,
+          exportedAt: new Date().toISOString(),
+          theme: resolvedTheme,
+          diagramBounds: bounds,
+          focusNodeId: focusIdRef.current,
+          selectedNodeId: selectedIdRef.current,
+          nodes: layout.map((ln) => ({
+            id: ln.node.id,
+            name: ln.node.name,
+            labels: ln.node.labels,
+            technology: ln.node.technology,
+            description: ln.node.description,
+            properties: ln.node.properties,
+            x: ln.x,
+            y: ln.y,
+            width: ln.width,
+            height: ln.height,
+            tagCount: tagCounts[ln.node.id] ?? 0,
+          })),
+          edges: edgesRef.current.map((e) => ({ ...e })),
+          edgeRoutes: edgePolylines.map((pl, i) => ({
+            points: pl.map((p) => ({ x: p.x, y: p.y })),
+            dotted: edgeDotted[i] ?? false,
+          })),
+          edgeLabels: placedLabels.map((g) => ({
+            text: g.text,
+            x: g.x,
+            y: g.y,
+            align: g.align,
+          })),
+        };
+        const blob = new Blob([JSON.stringify(payload, null, 2)], {
+          type: 'application/json;charset=utf-8',
+        });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'archmap-diagram.json';
         a.click();
         URL.revokeObjectURL(url);
       },
@@ -1066,7 +1263,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
       },
       fitToScreen,
     }),
-    [fitToScreen, simToLayout]
+    [fitToScreen, simToLayout, palette, resolvedTheme]
   );
 
   useEffect(() => {
@@ -1097,19 +1294,20 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
     const selected = selectedVisibleId
       ? visibleNodes.find((n) => n.id === selectedVisibleId)
       : null;
-    const selectedIsSoftwareSystem = Boolean(selected?.labels.includes('SoftwareSystem'));
-    const connectedToSelected = selectedVisibleId
-      ? new Set(
-          visibleEdges
-            .filter((e) => e.source === selectedVisibleId || e.target === selectedVisibleId)
-            .map((e) => (e.source === selectedVisibleId ? e.target : e.source))
-        ).size
-      : 0;
-    const useStraightEdges =
-      selectedIsSoftwareSystem && connectedToSelected > SOFTWARE_SYSTEM_STRAIGHT_EDGE_THRESHOLD;
-    fastModeRef.current =
-      selectedIsSoftwareSystem &&
-      (visibleNodes.length >= FAST_MODE_NODE_THRESHOLD || visibleEdges.length >= FAST_MODE_EDGE_THRESHOLD);
+    const nodeCount = visibleNodes.length;
+    const speedOptMode =
+      nodeCount < SPEED_OPT_MEDIUM_NODE_THRESHOLD
+        ? 'best'
+        : nodeCount <= SPEED_OPT_STRONG_NODE_THRESHOLD
+          ? 'medium'
+          : 'strong';
+
+    // Переиспользуем существующие флаги:
+    // - fastModeRef: включаем прогрессивную геометрию (ускорение) — medium
+    // - heavyModeRef: максимально агрессивная оптимизация — strong
+    fastModeRef.current = speedOptMode === 'medium';
+    heavyModeRef.current = speedOptMode === 'strong';
+    const useStraightEdges = speedOptMode !== 'best';
 
     const { simulation, simNodes } = createForceSimulation(
       visibleNodes,
@@ -1122,6 +1320,11 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
     simulationRef.current = simulation;
 
     const tick = () => {
+      if (heavyModeRef.current && simulation.alpha() < 0.055) {
+        simulation.stop();
+        onEnd();
+        return;
+      }
       layoutVersionRef.current += 1;
       geometryCacheRef.current = null;
       drawRef.current();
@@ -1143,6 +1346,14 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
     simulation.on('tick', tick);
     simulation.on('end', onEnd);
     simulation.alpha(1).restart();
+    if (heavyModeRef.current) {
+      window.setTimeout(() => {
+        if (simulationRef.current === simulation) {
+          simulation.stop();
+          onEnd();
+        }
+      }, HEAVY_MODE_MAX_TICKS * 16);
+    }
 
     if (fastModeRef.current) {
       const layout = simToLayout(simNodesRef.current);
@@ -1170,11 +1381,13 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
 
       let cursor = 0;
       const progressivePolylines: Point[][] = [];
+      const progressiveDotted: boolean[] = [];
       const labelCandidates: EdgeLabelGeom[] = [];
       geometryCacheRef.current = {
         layoutVersion: layoutVersionRef.current,
         focusId,
         edgePolylines: [],
+        edgeDotted: [],
         placedLabels: [],
       };
       drawRef.current();
@@ -1209,6 +1422,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
               ]
             : routeEdgeWithAStar(srcBox, tgtBox, layoutBoxes, edgeStartsHorizontal(src, tgt));
           progressivePolylines.push(points);
+          progressiveDotted.push(isStructuralEdgeRelationship(edge.type));
 
           const labelText = graphEdgeLabel(edge);
           if (labelText) {
@@ -1229,6 +1443,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
           layoutVersion: layoutVersionRef.current,
           focusId,
           edgePolylines: [...progressivePolylines],
+          edgeDotted: [...progressiveDotted],
           placedLabels: [],
         };
         drawRef.current();
@@ -1244,6 +1459,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
           layoutVersion: layoutVersionRef.current,
           focusId,
           edgePolylines: progressivePolylines,
+          edgeDotted: progressiveDotted,
           placedLabels,
         };
         deferredFullGeometryReadyRef.current = true;

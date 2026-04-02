@@ -36,6 +36,12 @@ export interface GraphEdge {
   technology?: string;
 }
 
+/** Child / Deploy — структурные связи; на диаграмме пунктиром, чтобы отличать от прочих отношений. */
+export function isStructuralEdgeRelationship(type: string): boolean {
+  const t = type.trim().toLowerCase();
+  return t === 'child' || t === 'deploy';
+}
+
 /** Подпись на схеме: для типа Relationship при заданной technology показываем её вместо слова «Relationship». */
 export function graphEdgeLabel(edge: GraphEdge): string {
   const t = edge.type.trim();

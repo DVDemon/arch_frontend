@@ -1,5 +1,19 @@
 import { C4_COLORS } from '../types/c4';
-import type { Point } from './astarGridRouter';
+import { GRID_CELL, type Point } from './astarGridRouter';
+import { getDiagramPalette, type DiagramPalette } from './diagramTheme';
+
+/** Согласовано с GraphCanvas (мини-карточки внутри группы). */
+const CLUSTER_MEMBER_W = 120;
+const CLUSTER_MEMBER_H = 48;
+const CLUSTER_HEADER_H = 24;
+const CLUSTER_BOX_PADDING = GRID_CELL;
+
+/** Данные группы для экспорта SVG (внутренние имена и тип). */
+export interface ClusterExportForSvg {
+  memberType: string;
+  edgeLabel: string;
+  members: { name: string }[];
+}
 
 const KNOWN = [
   'SoftwareSystem',
@@ -72,27 +86,49 @@ export function buildDiagramSvgString(options: {
   panY: number;
   layout: LayoutExportNode[];
   edgePolylines: Point[][];
+  /** Пунктир (Child / Deploy) — индекс как у edgePolylines */
+  edgeDotted?: boolean[];
   edgeLabels: EdgeLabelExport[];
   selectedId: string | null;
   /** Локальные теги: число по id узла (бейдж на карточке). */
   tagCounts?: Record<string, number>;
+  /** Если не задано — светлая палитра (обратная совместимость). */
+  palette?: DiagramPalette;
+  /** Схлопнутые группы: id узла-кластера → состав (как на canvas). */
+  clusters?: Record<string, ClusterExportForSvg>;
 }): string {
-  const { width, height, panX, panY, layout, edgePolylines, edgeLabels, selectedId, tagCounts } =
-    options;
+  const {
+    width,
+    height,
+    panX,
+    panY,
+    layout,
+    edgePolylines,
+    edgeDotted,
+    edgeLabels,
+    selectedId,
+    tagCounts,
+    palette: paletteOpt,
+    clusters,
+  } = options;
+  const pal = paletteOpt ?? getDiagramPalette(false);
   const parts: string[] = [];
   parts.push(
     `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">`
   );
-  parts.push(`<rect width="100%" height="100%" fill="#FAFAFA"/>`);
+  parts.push(`<rect width="100%" height="100%" fill="${pal.canvasBg}"/>`);
 
-  for (const pl of edgePolylines) {
+  for (let i = 0; i < edgePolylines.length; i++) {
+    const pl = edgePolylines[i]!;
     if (pl.length < 2) continue;
+    const dotted = edgeDotted?.[i] ?? false;
+    const dash = dotted ? ' stroke-dasharray="2 6"' : '';
     const d = polylineD(pl, panX, panY);
     parts.push(
-      `<path d="${d}" fill="none" stroke="#FFFFFF" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>`
+      `<path d="${d}" fill="none" stroke="${pal.edgeHalo}" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"${dash}/>`
     );
     parts.push(
-      `<path d="${d}" fill="none" stroke="#BBBBBB" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round"/>`
+      `<path d="${d}" fill="none" stroke="${pal.edgeStroke}" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round"${dash}/>`
     );
     const a = pl[pl.length - 2]!;
     const b = pl[pl.length - 1]!;
@@ -105,7 +141,7 @@ export function buildDiagramSvgString(options: {
     const p2x = bx - s * Math.cos(ang + 0.4);
     const p2y = by - s * Math.sin(ang + 0.4);
     parts.push(
-      `<polygon points="${bx},${by} ${p1x},${p1y} ${p2x},${p2y}" fill="#BBBBBB"/>`
+      `<polygon points="${bx},${by} ${p1x},${p1y} ${p2x},${p2y}" fill="${pal.edgeStroke}"/>`
     );
   }
 
@@ -115,11 +151,12 @@ export function buildDiagramSvgString(options: {
     const anchor =
       g.align === 'center' ? 'middle' : g.align === 'right' ? 'end' : 'start';
     parts.push(
-      `<text x="${tx}" y="${ty}" text-anchor="${anchor}" dominant-baseline="alphabetic" font-family="JetBrains Mono, monospace" font-size="11" fill="#444444" stroke="#FAFAFA" stroke-width="2" paint-order="stroke fill">${escapeXml(g.text)}</text>`
+      `<text x="${tx}" y="${ty}" text-anchor="${anchor}" dominant-baseline="alphabetic" font-family="JetBrains Mono, monospace" font-size="11" fill="${pal.edgeLabelText}" stroke="${pal.edgeLabelTextHalo}" stroke-width="2" paint-order="stroke fill">${escapeXml(g.text)}</text>`
     );
   }
 
   for (const ln of layout) {
+    const cm = clusters?.[ln.id];
     const mainLabel = getMainLabel(ln.labels);
     const color = C4_COLORS[mainLabel] || '#777';
     const x = ln.x + panX;
@@ -127,14 +164,38 @@ export function buildDiagramSvgString(options: {
     const isSel = selectedId === ln.id;
     const tc = tagCounts?.[ln.id] ?? 0;
 
+    if (cm) {
+      if (isSel) {
+        parts.push(
+          `<rect x="${x - 3}" y="${y - 3}" width="${ln.width + 6}" height="${ln.height + 6}" fill="none" stroke="${color}" stroke-width="2" opacity="0.85"/>`
+        );
+      }
+      const strokeW = isSel ? 2 : 1.5;
+      const strokeC = isSel ? color : pal.clusterOuterBorder;
+      parts.push(
+        `<rect x="${x}" y="${y}" width="${ln.width}" height="${ln.height}" fill="${pal.cardFill}" stroke="${strokeC}" stroke-width="${strokeW}" stroke-dasharray="8 6"/>`
+      );
+      const edgePipe =
+        cm.edgeLabel && cm.edgeLabel !== '(no-label)' ? ` | ${cm.edgeLabel}` : '';
+      parts.push(
+        `<text x="${x + 10}" y="${y + 15}" font-family="JetBrains Mono, monospace" font-size="10" font-weight="bold" fill="${color}">[GROUP ${escapeXml(cm.memberType.toUpperCase())}]</text>`
+      );
+      parts.push(
+        `<text x="${x + 10}" y="${y + 28}" font-family="JetBrains Mono, monospace" font-size="10" fill="${pal.clusterTitleMuted}">${cm.members.length} nodes${escapeXml(edgePipe)}</text>`
+      );
+      continue;
+    }
+
     if (isSel) {
       parts.push(
         `<rect x="${x - 3}" y="${y - 3}" width="${ln.width + 6}" height="${ln.height + 6}" fill="none" stroke="${color}" stroke-width="2" opacity="0.85"/>`
       );
     }
-    parts.push(`<rect x="${x}" y="${y}" width="${ln.width}" height="${ln.height}" fill="#FFFFFF" stroke="${isSel ? color : '#E0E0E0'}" stroke-width="${isSel ? 2 : 1}"/>`);
+    parts.push(
+      `<rect x="${x}" y="${y}" width="${ln.width}" height="${ln.height}" fill="${pal.cardFill}" stroke="${isSel ? color : pal.cardBorder}" stroke-width="${isSel ? 2 : 1}"/>`
+    );
     if (tc > 0) {
-      parts.push(`<rect x="${x}" y="${y}" width="${ln.width}" height="3" fill="#FFB74D"/>`);
+      parts.push(`<rect x="${x}" y="${y}" width="${ln.width}" height="3" fill="${pal.tagStrip}"/>`);
     }
     parts.push(`<rect x="${x}" y="${y}" width="4" height="${ln.height}" fill="${color}"/>`);
 
@@ -145,13 +206,13 @@ export function buildDiagramSvgString(options: {
       `<text x="${x + 12}" y="${y + 18}" font-family="JetBrains Mono, monospace" font-size="10" fill="${color}">[${escapeXml(tag)}]</text>`
     );
     parts.push(
-      `<text x="${x + 12}" y="${y + 38}" font-family="JetBrains Mono, monospace" font-size="12" fill="#000000">${escapeXml(name)}</text>`
+      `<text x="${x + 12}" y="${y + 38}" font-family="JetBrains Mono, monospace" font-size="12" fill="${pal.textPrimary}">${escapeXml(name)}</text>`
     );
     if (ln.technology) {
       const tech =
         ln.technology.length > 26 ? ln.technology.slice(0, 24) + '...' : ln.technology;
       parts.push(
-        `<text x="${x + 12}" y="${y + 56}" font-family="JetBrains Mono, monospace" font-size="10" fill="#888888">${escapeXml(tech)}</text>`
+        `<text x="${x + 12}" y="${y + 56}" font-family="JetBrains Mono, monospace" font-size="10" fill="${pal.textSecondary}">${escapeXml(tech)}</text>`
       );
     }
 
@@ -165,14 +226,42 @@ export function buildDiagramSvgString(options: {
       const bx = x + ln.width - badgeW - pad;
       const by = y + pad;
       parts.push(
-        `<rect x="${bx}" y="${by}" width="${badgeW}" height="${badgeH}" rx="4" fill="#FFF3E0" stroke="#E65100" stroke-width="1"/>`
+        `<rect x="${bx}" y="${by}" width="${badgeW}" height="${badgeH}" rx="4" fill="${pal.badgeFill}" stroke="${pal.badgeStroke}" stroke-width="1"/>`
       );
       parts.push(
-        `<polygon points="${bx + 5},${by + 5} ${bx + 9},${by + 12} ${bx + 1},${by + 12}" fill="#E65100"/>`
+        `<polygon points="${bx + 5},${by + 5} ${bx + 9},${by + 12} ${bx + 1},${by + 12}" fill="${pal.badgeIcon}"/>`
       );
       parts.push(
-        `<text x="${bx + iconSlot + 4}" y="${by + 13}" font-family="JetBrains Mono, monospace" font-size="10" font-weight="bold" fill="#BF360C">${escapeXml(countStr)}</text>`
+        `<text x="${bx + iconSlot + 4}" y="${by + 13}" font-family="JetBrains Mono, monospace" font-size="10" font-weight="bold" fill="${pal.badgeText}">${escapeXml(countStr)}</text>`
       );
+    }
+  }
+
+  if (clusters && Object.keys(clusters).length > 0) {
+    for (const ln of layout) {
+      const cm = clusters[ln.id];
+      if (!cm) continue;
+      const mainLabel = getMainLabel(ln.labels);
+      const color = C4_COLORS[mainLabel] || '#777';
+      const x = ln.x + panX;
+      const y = ln.y + panY;
+      const cols = Math.ceil(Math.sqrt(cm.members.length));
+      const innerStartX = x + CLUSTER_BOX_PADDING;
+      const innerStartY = y + CLUSTER_BOX_PADDING + CLUSTER_HEADER_H;
+      cm.members.forEach((member, idx) => {
+        const col = idx % cols;
+        const row = Math.floor(idx / cols);
+        const mx = innerStartX + col * (CLUSTER_MEMBER_W + GRID_CELL);
+        const my = innerStartY + row * (CLUSTER_MEMBER_H + GRID_CELL);
+        const shortName =
+          member.name.length > 14 ? `${member.name.slice(0, 12)}...` : member.name;
+        parts.push(
+          `<rect x="${mx}" y="${my}" width="${CLUSTER_MEMBER_W}" height="${CLUSTER_MEMBER_H}" fill="${pal.clusterInnerFill}" stroke="${pal.clusterInnerBorder}" stroke-width="1"/>`
+        );
+        parts.push(
+          `<text x="${mx + 8}" y="${my + 22}" font-family="JetBrains Mono, monospace" font-size="10" fill="${color}">${escapeXml(shortName)}</text>`
+        );
+      });
     }
   }
 

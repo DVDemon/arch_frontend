@@ -16,7 +16,7 @@ export interface Point {
 }
 
 /** Шаг ортогональной сетки A* (px). Больше шаг — меньше ячеек и быстрее поиск. */
-export const GRID_CELL = 20;
+export const GRID_CELL = 60;
 
 const OBSTACLE_PAD = 2;
 const INTERIOR_EPS = 0.5;

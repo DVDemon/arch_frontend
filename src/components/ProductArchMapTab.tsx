@@ -48,16 +48,6 @@ const KNOWN_LABELS = [
   "InfrastructureNode",
 ] as const;
 
-const C4_LABELS: { value: C4Label; display: string }[] = [
-  { value: "SoftwareSystem", display: "Software System" },
-  { value: "Container", display: "Container" },
-  { value: "Component", display: "Component" },
-  { value: "DeploymentNode", display: "Deployment Node" },
-  { value: "Environment", display: "Environment" },
-  { value: "ContainerInstance", display: "Container Instance" },
-  { value: "InfrastructureNode", display: "Infrastructure Node" },
-];
-
 const C4_COLORS: Record<string, string> = {
   SoftwareSystem: "#1A73E8",
   Container: "#00897B",
@@ -225,7 +215,10 @@ async function executeCypher(query: string): Promise<Record<string, unknown>[]> 
 
 function graphTagPredicate(alias: string, tag: GraphTag): string {
   if (tag === "All") return "true";
-  return `${alias}.graphTag = '${tag}'`;
+  // В БД значения могут отличаться по регистру и содержать подстроку:
+  // поэтому делаем case-insensitive CONTAINS.
+  const needle = tag.toLowerCase();
+  return `toLower(coalesce(${alias}.graphTag, '')) CONTAINS '${needle}'`;
 }
 
 function mainLabel(labels: string[]): string {
@@ -297,16 +290,18 @@ export default function ProductArchMapTab({
   productName: string;
   productAlias: string;
 }) {
-  const [graphTag, setGraphTag] = useState<GraphTag>("All");
-  const [searchLabel, setSearchLabel] = useState<C4Label>("SoftwareSystem");
-  const [searchName, setSearchName] = useState("");
-  const [searchLoading, setSearchLoading] = useState(false);
+  // Всегда выбираем данные по graphTag, содержащему "global"
+  const [graphTag] = useState<GraphTag>("Global");
   const [graphLoading, setGraphLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [results, setResults] = useState<C4Node[]>([]);
   const [graph, setGraph] = useState<GraphData>({ nodes: [], edges: [] });
   const [selectedNode, setSelectedNode] = useState<C4Node | null>(null);
-  const [path, setPath] = useState<string[]>([]);
+  const [diagramNameFilter, setDiagramNameFilter] = useState("");
+  const [typeVisibility, setTypeVisibility] = useState<Record<C4Label, boolean>>(() => {
+    const m = {} as Record<C4Label, boolean>;
+    for (const l of KNOWN_LABELS) m[l as C4Label] = true;
+    return m;
+  });
   const [leftCollapsed, setLeftCollapsed] = useState(false);
   const [rightCollapsed, setRightCollapsed] = useState(false);
   const [tagsState, setTagsState] = useState<Record<string, string[]>>(() => {
@@ -344,7 +339,6 @@ export default function ProductArchMapTab({
       const systems = systemsByName.length
         ? systemsByName
         : await searchByLabelAndName(graphTag, "SoftwareSystem", productAlias);
-      setResults(systems);
       const exact =
         systems.find((s) => s.name.trim().toLowerCase() === needle.toLowerCase()) ??
         systems.find((s) => s.name.trim().toLowerCase() === productAlias.trim().toLowerCase()) ??
@@ -352,13 +346,11 @@ export default function ProductArchMapTab({
       if (!exact) {
         setGraph({ nodes: [], edges: [] });
         setSelectedNode(null);
-        setPath([needle || productAlias]);
         return;
       }
       const subgraph = await loadNeighborhoodSubgraph(exact, graphTag);
       setGraph(subgraph);
       setSelectedNode(exact);
-      setPath([exact.name]);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Ошибка загрузки диаграммы");
     } finally {
@@ -370,29 +362,14 @@ export default function ProductArchMapTab({
     void loadSystemRoot();
   }, [loadSystemRoot]);
 
-  const runSearch = useCallback(async () => {
-    setSearchLoading(true);
-    setError(null);
-    try {
-      const nodes = await searchByLabelAndName(graphTag, searchLabel, searchName);
-      setResults(nodes);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Ошибка поиска");
-      setResults([]);
-    } finally {
-      setSearchLoading(false);
-    }
-  }, [graphTag, searchLabel, searchName]);
-
   const openNode = useCallback(
-    async (node: C4Node, addToPath = true) => {
+    async (node: C4Node) => {
       setGraphLoading(true);
       setError(null);
       try {
         const subgraph = await loadNeighborhoodSubgraph(node, graphTag);
         setGraph(subgraph);
         setSelectedNode(node);
-        setPath((prev) => (addToPath ? [...prev, node.name] : [node.name]));
       } catch (e) {
         setError(e instanceof Error ? e.message : "Ошибка загрузки узла");
       } finally {
@@ -421,13 +398,40 @@ export default function ProductArchMapTab({
     }
     return { nodes, edges };
   }, [graph.edges, graph.nodes, selectedNode]);
+
+  const visibleTypeSet = useMemo(() => {
+    const out = new Set<C4Label>();
+    (Object.keys(typeVisibility) as C4Label[]).forEach((k) => {
+      if (typeVisibility[k]) out.add(k);
+    });
+    return out;
+  }, [typeVisibility]);
+
+  const visibleGraphData = useMemo(() => {
+    const nodes = (graphData.nodes as ArchNode[]).filter((n) => {
+      const t = mainLabel(n.labels) as C4Label;
+      return visibleTypeSet.has(t);
+    });
+    const idSet = new Set(nodes.map((n) => n.id));
+    const edges = (graphData.edges as ArchEdge[]).filter((e) => idSet.has(e.source) && idSet.has(e.target));
+    return { nodes, edges };
+  }, [graphData, visibleTypeSet]);
+
+  const visibleNodeIds = useMemo(() => new Set(visibleGraphData.nodes.map((n) => n.id)), [visibleGraphData.nodes]);
+
   const displayedNodes = useMemo(
     () =>
-      [...(graphData.nodes as C4Node[])].sort((a, b) =>
+      [...(visibleGraphData.nodes as C4Node[])].sort((a, b) =>
         a.name.localeCompare(b.name, undefined, { sensitivity: "base" })
       ),
-    [graphData.nodes]
+    [visibleGraphData.nodes]
   );
+
+  const filteredDisplayedNodes = useMemo(() => {
+    const q = diagramNameFilter.trim().toLowerCase();
+    if (!q) return displayedNodes;
+    return displayedNodes.filter((n) => n.name.toLowerCase().includes(q));
+  }, [displayedNodes, diagramNameFilter]);
 
   const selectedTags = selectedNode ? tagsState[selectedNode.id] ?? [] : [];
   const tagCountByNodeId = useMemo(() => {
@@ -440,136 +444,156 @@ export default function ProductArchMapTab({
 
   return (
     <div className="flex h-full overflow-hidden rounded-xl border border-zinc-200 dark:border-zinc-700">
-      <aside className={`${leftCollapsed ? "w-12" : "w-80"} flex shrink-0 flex-col border-r border-zinc-200 bg-zinc-50/70 p-2 dark:border-zinc-700 dark:bg-zinc-800/30`}>
+      <aside
+        className={`${leftCollapsed ? "w-12" : "w-80"} flex h-full min-h-0 shrink-0 flex-col border-r border-zinc-200 bg-zinc-50/70 p-2 dark:border-zinc-700 dark:bg-zinc-800/30`}
+      >
         <button
           type="button"
           onClick={() => setLeftCollapsed((v) => !v)}
-          className="mb-2 rounded border border-zinc-300 px-2 py-1 text-xs dark:border-zinc-600"
+          className="mb-2 shrink-0 rounded border border-zinc-300 px-2 py-1 text-xs dark:border-zinc-600"
           title={leftCollapsed ? "Развернуть левую панель" : "Свернуть левую панель"}
         >
           {leftCollapsed ? "»" : "«"}
         </button>
         {!leftCollapsed && (
-          <>
-        <div className="mb-3 text-sm font-semibold text-zinc-800 dark:text-zinc-200">
-          Навигация
-        </div>
-        <div className="mb-3 rounded-md border border-zinc-200 bg-white px-3 py-2 text-xs text-zinc-600 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300">
-          Текущий путь: {path.length ? path.join(" / ") : "—"}
-        </div>
-
-        <button
-          type="button"
-          onClick={() => void loadSystemRoot()}
-          className="mb-3 rounded-md border border-amber-500 bg-amber-50 px-3 py-2 text-left text-sm font-medium text-amber-700 hover:bg-amber-100 dark:bg-amber-900/30 dark:text-amber-300 dark:hover:bg-amber-900/40"
-        >
-          Система: {productName || "—"}
-        </button>
-
-        <div className="mb-2 grid grid-cols-1 gap-2">
-          <select
-            value={graphTag}
-            onChange={(e) => setGraphTag(e.target.value as GraphTag)}
-            className="rounded-md border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-900"
-          >
-            <option value="Global">Global</option>
-            <option value="Local">Local</option>
-            <option value="All">All</option>
-          </select>
-          <select
-            value={searchLabel}
-            onChange={(e) => setSearchLabel(e.target.value as C4Label)}
-            className="rounded-md border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-900"
-          >
-            {C4_LABELS.map((l) => (
-              <option key={l.value} value={l.value}>
-                {l.display}
-              </option>
-            ))}
-          </select>
-          <input
-            value={searchName}
-            onChange={(e) => setSearchName(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") void runSearch();
-            }}
-            placeholder="Поиск по имени"
-            className="rounded-md border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-900"
-          />
-          <button
-            type="button"
-            onClick={() => void runSearch()}
-            disabled={searchLoading}
-            className="rounded-md bg-zinc-800 px-3 py-1.5 text-sm text-white hover:bg-zinc-900 disabled:opacity-50 dark:bg-zinc-700 dark:hover:bg-zinc-600"
-          >
-            {searchLoading ? "Поиск..." : "Найти"}
-          </button>
-          <div className="grid grid-cols-2 gap-2 pt-2">
-            <button type="button" onClick={() => graphRef.current?.zoomIn()} className="rounded-md border border-zinc-300 px-2 py-1 text-xs dark:border-zinc-600">
-              Zoom +
-            </button>
-            <button type="button" onClick={() => graphRef.current?.zoomOut()} className="rounded-md border border-zinc-300 px-2 py-1 text-xs dark:border-zinc-600">
-              Zoom -
-            </button>
-            <button type="button" onClick={() => graphRef.current?.fitToScreen()} className="rounded-md border border-zinc-300 px-2 py-1 text-xs dark:border-zinc-600">
-              FIT
-            </button>
-            <button type="button" onClick={() => graphRef.current?.exportPng()} className="rounded-md border border-zinc-300 px-2 py-1 text-xs dark:border-zinc-600">
-              PNG
-            </button>
-          </div>
-        </div>
-
-        <div className="min-h-0 flex-1 overflow-auto rounded-md border border-zinc-200 bg-white dark:border-zinc-700 dark:bg-zinc-900">
-          {results.map((node) => {
-            const label = mainLabel(node.labels);
-            return (
+          <div className="flex min-h-0 flex-1 flex-col gap-2">
+            <div className="flex shrink-0 items-center justify-center gap-1 border-b border-zinc-200 pb-2 dark:border-zinc-700">
               <button
-                key={node.id}
                 type="button"
-                onClick={() => void openNode(node)}
-                className="flex w-full flex-col items-start border-b border-zinc-100 px-3 py-2 text-left hover:bg-zinc-50 dark:border-zinc-800 dark:hover:bg-zinc-800/60"
+                onClick={() => graphRef.current?.zoomIn()}
+                className="rounded-md border border-zinc-300 p-2 text-zinc-700 hover:bg-zinc-100 dark:border-zinc-600 dark:text-zinc-200 dark:hover:bg-zinc-700/60"
+                title="Увеличить"
+                aria-label="Увеличить масштаб"
               >
-                <span className="text-[10px] font-semibold" style={{ color: C4_COLORS[label] ?? "#777" }}>
-                  [{label}]
-                </span>
-                <span className="text-sm text-zinc-800 dark:text-zinc-200">{node.name}</span>
+                <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5} aria-hidden>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M21 21l-5.197-5.197m0 0A7.5 7.5 0 105.196 5.196a7.5 7.5 0 0010.607 10.607zM10.5 7.5v6m3-3h-6" />
+                </svg>
               </button>
-            );
-          })}
-          {results.length === 0 && (
-            <div className="px-3 py-4 text-sm text-zinc-500 dark:text-zinc-400">Нет результатов</div>
-          )}
-        </div>
-
-        <div className="mt-3 min-h-0 max-h-64 overflow-auto rounded-md border border-zinc-200 bg-white dark:border-zinc-700 dark:bg-zinc-900">
-          <div className="sticky top-0 border-b border-zinc-100 bg-zinc-50 px-3 py-2 text-xs font-semibold text-zinc-700 dark:border-zinc-800 dark:bg-zinc-800/80 dark:text-zinc-300">
-            На диаграмме ({displayedNodes.length})
-          </div>
-          {displayedNodes.map((node) => {
-            const label = mainLabel(node.labels);
-            const isActive = selectedNode?.id === node.id;
-            return (
               <button
-                key={`graph-node-${node.id}`}
                 type="button"
-                onClick={() => void openNode(node)}
-                className={`flex w-full flex-col items-start border-b border-zinc-100 px-3 py-2 text-left hover:bg-zinc-50 dark:border-zinc-800 dark:hover:bg-zinc-800/60 ${
-                  isActive ? "bg-zinc-100 dark:bg-zinc-800/70" : ""
-                }`}
+                onClick={() => graphRef.current?.zoomOut()}
+                className="rounded-md border border-zinc-300 p-2 text-zinc-700 hover:bg-zinc-100 dark:border-zinc-600 dark:text-zinc-200 dark:hover:bg-zinc-700/60"
+                title="Уменьшить"
+                aria-label="Уменьшить масштаб"
               >
-                <span className="text-[10px] font-semibold" style={{ color: C4_COLORS[label] ?? "#777" }}>
-                  [{label}]
-                </span>
-                <span className="text-sm text-zinc-800 dark:text-zinc-200">{node.name}</span>
+                <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5} aria-hidden>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M21 21l-5.197-5.197m0 0A7.5 7.5 0 105.196 5.196a7.5 7.5 0 0010.607 10.607zM13.5 10.5h-6" />
+                </svg>
               </button>
-            );
-          })}
-          {displayedNodes.length === 0 && (
-            <div className="px-3 py-4 text-sm text-zinc-500 dark:text-zinc-400">На диаграмме нет узлов</div>
-          )}
-        </div>
-          </>
+              <button
+                type="button"
+                onClick={() => graphRef.current?.fitToScreen()}
+                className="rounded-md border border-zinc-300 p-2 text-zinc-700 hover:bg-zinc-100 dark:border-zinc-600 dark:text-zinc-200 dark:hover:bg-zinc-700/60"
+                title="По размеру окна"
+                aria-label="Вписать диаграмму в экран"
+              >
+                <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5} aria-hidden>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M3.75 3.75v4.5m0-4.5h4.5m-4.5 0L9 9M3.75 20.25v-4.5m0 4.5h4.5m-4.5 0L9 15M20.25 3.75h-4.5m4.5 0v4.5m0-4.5L15 9m5.25 11.25v-4.5m0 4.5h-4.5m4.5 0L15 15" />
+                </svg>
+              </button>
+              <div className="flex flex-wrap gap-1" role="group" aria-label="Экспорт диаграммы">
+                <button
+                  type="button"
+                  onClick={() => graphRef.current?.exportPng()}
+                  className="rounded-md border border-zinc-300 p-2 text-zinc-700 hover:bg-zinc-100 dark:border-zinc-600 dark:text-zinc-200 dark:hover:bg-zinc-700/60"
+                  title="Экспорт PNG"
+                  aria-label="Экспорт диаграммы в PNG"
+                >
+                  <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5} aria-hidden>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M2.25 15.75l5.159-5.159a2.25 2.25 0 013.182 0l5.159 5.159m-1.5-1.5l1.409-1.409a2.25 2.25 0 013.182 0l2.909 2.909m-18 3.75h16.5a1.5 1.5 0 001.5-1.5V6a1.5 1.5 0 00-1.5-1.5H3.75A1.5 1.5 0 002.25 6v12a1.5 1.5 0 001.5 1.5zm10.5-11.25h.008v.008h-.008V8.25zm.375 0a.375.375 0 11-.75 0 .375.375 0 01.75 0z" />
+                  </svg>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => graphRef.current?.exportSvg()}
+                  className="rounded-md border border-zinc-300 p-2 text-zinc-700 hover:bg-zinc-100 dark:border-zinc-600 dark:text-zinc-200 dark:hover:bg-zinc-700/60"
+                  title="Экспорт SVG"
+                  aria-label="Экспорт диаграммы в SVG"
+                >
+                  <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5} aria-hidden>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M17.25 6.75L22.5 12l-5.25 5.25m-10.5 0L1.5 12l5.25-5.25m7.5-3l-4.5 16.5" />
+                  </svg>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => graphRef.current?.exportJson()}
+                  className="rounded-md border border-zinc-300 p-2 text-zinc-700 hover:bg-zinc-100 dark:border-zinc-600 dark:text-zinc-200 dark:hover:bg-zinc-700/60"
+                  title="Экспорт JSON (узлы, рёбра, координаты)"
+                  aria-label="Экспорт диаграммы в JSON"
+                >
+                  <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5} aria-hidden>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5a3.375 3.375 0 00-3.375-3.375H8.25m0 12.75h7.5m-7.5 3H12M10.5 2.25H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 00-9-9z" />
+                  </svg>
+                </button>
+              </div>
+            </div>
+
+            <div className="flex shrink-0 flex-col gap-1 rounded-md border border-zinc-200 bg-white px-3 py-2 dark:border-zinc-700 dark:bg-zinc-900">
+              <div className="text-xs font-semibold text-zinc-700 dark:text-zinc-300">Типы</div>
+              <div className="flex flex-wrap gap-x-3 gap-y-1 pt-1">
+                {KNOWN_LABELS.map((l) => {
+                  const t = l as C4Label;
+                  const checked = typeVisibility[t] ?? true;
+                  return (
+                    <label
+                      key={l}
+                      className="flex cursor-pointer items-center gap-2 text-xs text-zinc-700 dark:text-zinc-200"
+                      title={l}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={checked}
+                        onChange={(e) =>
+                          setTypeVisibility((prev) => ({
+                            ...prev,
+                            [t]: e.target.checked,
+                          }))
+                        }
+                        className="h-3 w-3 accent-amber-600"
+                      />
+                      <span className="whitespace-nowrap">[{l}]</span>
+                    </label>
+                  );
+                })}
+              </div>
+            </div>
+
+            <div className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-md border border-zinc-200 bg-white dark:border-zinc-700 dark:bg-zinc-900">
+              <input
+                value={diagramNameFilter}
+                onChange={(e) => setDiagramNameFilter(e.target.value)}
+                placeholder="Фильтр по имени…"
+                className="shrink-0 border-b border-zinc-200 bg-white px-3 py-2 text-sm text-zinc-900 placeholder:text-zinc-400 focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100"
+              />
+              <div className="min-h-0 flex-1 overflow-auto">
+                {filteredDisplayedNodes.map((node) => {
+                  const label = mainLabel(node.labels);
+                  const isActive = selectedNode?.id === node.id;
+                  return (
+                    <button
+                      key={`graph-node-${node.id}`}
+                      type="button"
+                      onClick={() => void openNode(node)}
+                      className={`flex w-full flex-col items-start border-b border-zinc-100 px-3 py-2 text-left hover:bg-zinc-50 dark:border-zinc-800 dark:hover:bg-zinc-800/60 ${
+                        isActive ? "bg-zinc-100 dark:bg-zinc-800/70" : ""
+                      }`}
+                    >
+                      <span className="text-[10px] font-semibold" style={{ color: C4_COLORS[label] ?? "#777" }}>
+                        [{label}]
+                      </span>
+                      <span className="text-sm text-zinc-800 dark:text-zinc-200">{node.name}</span>
+                    </button>
+                  );
+                })}
+                {displayedNodes.length === 0 && (
+                  <div className="px-3 py-4 text-sm text-zinc-500 dark:text-zinc-400">На диаграмме нет узлов</div>
+                )}
+                {displayedNodes.length > 0 && filteredDisplayedNodes.length === 0 && (
+                  <div className="px-3 py-4 text-sm text-zinc-500 dark:text-zinc-400">Нет совпадений по имени</div>
+                )}
+              </div>
+            </div>
+          </div>
         )}
       </aside>
 
@@ -579,16 +603,16 @@ export default function ProductArchMapTab({
             Загрузка диаграммы...
           </div>
         )}
-        {!graphLoading && graphData.nodes.length === 0 && (
+        {!graphLoading && visibleGraphData.nodes.length === 0 && (
           <div className="flex h-full items-center justify-center text-zinc-500 dark:text-zinc-400">
             Диаграмма пуста
           </div>
         )}
-        {!graphLoading && graphData.nodes.length > 0 && (
+        {!graphLoading && visibleGraphData.nodes.length > 0 && (
           <GraphCanvas
             ref={graphRef}
-            nodes={graphData.nodes}
-            edges={graphData.edges}
+            nodes={visibleGraphData.nodes}
+            edges={visibleGraphData.edges}
             focusNodeId={selectedNode?.id ?? null}
             selectedNodeId={selectedNode?.id ?? null}
             tagCountByNodeId={tagCountByNodeId}
@@ -629,7 +653,9 @@ export default function ProductArchMapTab({
         {selectedNode && (
           <div className="min-h-0 flex-1 overflow-auto rounded-md border border-zinc-200 dark:border-zinc-700">
             <div className="border-b border-zinc-200 px-3 py-2 dark:border-zinc-700">
-              <div className="font-medium text-zinc-900 dark:text-zinc-100">{selectedNode.name}</div>
+              <div className="whitespace-pre-line font-medium text-zinc-900 dark:text-zinc-100">
+                {selectedNode.name.replace(/~/g, '\n')}
+              </div>
               <div className="text-xs text-zinc-500 dark:text-zinc-400">{selectedNode.labels.join(", ")}</div>
             </div>
             <table className="w-full text-sm">
