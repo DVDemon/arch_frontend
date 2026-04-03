@@ -26,6 +26,7 @@ import {
   type Point,
 } from '../lib/astarGridRouter';
 import { buildDiagramSvgString, type ClusterExportForSvg } from '../lib/graphExportSvg';
+import { buildPlantUmlComponentDiagram } from '../lib/graphExportPlantUml';
 import { computeDiagramBounds } from '../lib/graphDiagramBounds';
 import { getDiagramPalette, type DiagramPalette } from '../lib/diagramTheme';
 import { useTheme } from '@/components/ThemeProvider';
@@ -38,6 +39,10 @@ interface GraphCanvasProps {
   selectedNodeId: string | null;
   /** Число локальных тегов по id узла (инциденты / точки отказа). */
   tagCountByNodeId?: ReadonlyMap<string, number>;
+  /** Прикреплённые к диаграмме узлы (для отображения переключателя «вкл»). */
+  pinnedNodeIds?: ReadonlySet<string>;
+  /** Переключатель прикрепления в углу карточки; если не задан — не рисуется. */
+  onPinToggle?: (node: C4Node, pinned: boolean) => void;
   onNodeClick: (node: C4Node) => void;
   emptyHint?: string;
   loading?: boolean;
@@ -48,6 +53,8 @@ export interface GraphCanvasHandle {
   exportSvg: () => void;
   /** Узлы с координатами, рёбра, маршруты линий и подписи — для скриптов и внешних инструментов. */
   exportJson: () => void;
+  /** PlantUML component diagram (.puml). */
+  exportPlantUml: () => void;
   zoomIn: () => void;
   zoomOut: () => void;
   resetZoom: () => void;
@@ -219,6 +226,55 @@ const CLUSTER_HEADER_H = 24;
 const CLUSTER_BOX_PADDING = GRID_CELL;
 const LOW_QUALITY_SPLINE_EDGE_THRESHOLD = 100;
 
+/** Мини-переключатель «прикрепить» в правом нижнем углу карточки (мир. координаты), чтобы не пересекать текст слева. */
+const PIN_TOGGLE_W = 30;
+const PIN_TOGGLE_H = 14;
+const PIN_TOGGLE_PAD_X = 8;
+const PIN_TOGGLE_PAD_BOTTOM = 6;
+
+function pinToggleRect(ln: LayoutNode): { x: number; y: number; w: number; h: number } {
+  return {
+    x: ln.x + ln.width - PIN_TOGGLE_W - PIN_TOGGLE_PAD_X,
+    y: ln.y + ln.height - PIN_TOGGLE_PAD_BOTTOM - PIN_TOGGLE_H,
+    w: PIN_TOGGLE_W,
+    h: PIN_TOGGLE_H,
+  };
+}
+
+function hitTestPinToggle(ln: LayoutNode, x: number, y: number): boolean {
+  const r = pinToggleRect(ln);
+  return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h;
+}
+
+function drawPinToggle(
+  ctx: CanvasRenderingContext2D,
+  ln: LayoutNode,
+  isPinned: boolean,
+  palette: DiagramPalette
+): void {
+  const r = pinToggleRect(ln);
+  const rr = PIN_TOGGLE_H / 2;
+  ctx.save();
+  ctx.beginPath();
+  roundRectPath(ctx, r.x, r.y, r.w, r.h, rr);
+  ctx.fillStyle = isPinned ? 'rgba(245, 158, 11, 0.35)' : palette.cardBorder;
+  ctx.fill();
+  ctx.strokeStyle = palette.clusterOuterBorder;
+  ctx.lineWidth = 1;
+  ctx.stroke();
+  const pad = 2;
+  const thumbR = (PIN_TOGGLE_H - pad * 2) / 2;
+  const cx = isPinned ? r.x + r.w - pad - thumbR : r.x + pad + thumbR;
+  const cy = r.y + PIN_TOGGLE_H / 2;
+  ctx.beginPath();
+  ctx.arc(cx, cy, thumbR, 0, Math.PI * 2);
+  ctx.fillStyle = isPinned ? '#d97706' : palette.clusterInnerFill;
+  ctx.fill();
+  ctx.strokeStyle = palette.clusterInnerBorder;
+  ctx.stroke();
+  ctx.restore();
+}
+
 function nodeMainLabel(node: C4Node): string {
   return getMainLabel(node.labels);
 }
@@ -255,7 +311,9 @@ function clusterDimensions(memberCount: number): { width: number; height: number
 function collapseDenseSimilarNodes(
   nodes: C4Node[],
   edges: GraphEdge[],
-  selectedNodeId: string | null
+  selectedNodeId: string | null,
+  /** Прикреплённые узлы никогда не схлопываются в группы. */
+  pinnedNodeIds?: ReadonlySet<string> | null
 ): {
   nodes: C4Node[];
   edges: GraphEdge[];
@@ -288,6 +346,7 @@ function collapseDenseSimilarNodes(
     if (!src || !tgt) return;
     const addCandidate = (member: C4Node) => {
       if (member.id === selectedNodeId) return;
+      if (pinnedNodeIds?.has(member.id)) return;
       const memberType = nodeMainLabel(member);
       if (!eligibleTypes.has(memberType)) return;
       // Группируем по фактически отрисовываемой подписи связи + типу узла.
@@ -337,6 +396,7 @@ function collapseDenseSimilarNodes(
         __clusterType: g.memberType,
         __clusterSize: members.length,
         __clusterEdgeLabel: g.edgeLabel === '(no-label)' ? '' : g.edgeLabel,
+        __clusterMemberNames: members.map((m) => m.name).join(', '),
         __clusterWidth: dim.width,
         __clusterHeight: dim.height,
       },
@@ -717,7 +777,8 @@ function paintDiagramNodes(
   sel: string | null,
   tagCountByNodeId: ReadonlyMap<string, number>,
   clusterMetaById: ReadonlyMap<string, ClusterMeta>,
-  palette: DiagramPalette
+  palette: DiagramPalette,
+  pinnedNodeIds?: ReadonlySet<string>
 ): void {
   layout.forEach((ln) => {
     const mainLabel = getMainLabel(ln.node.labels);
@@ -803,6 +864,10 @@ function paintDiagramNodes(
     }
 
     drawTagBadge(ctx, ln, tagCount, palette);
+    if (pinnedNodeIds !== undefined) {
+      const pinned = pinnedNodeIds.has(ln.node.id);
+      drawPinToggle(ctx, ln, pinned, palette);
+    }
   });
 }
 
@@ -904,6 +969,8 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
     focusNodeId = null,
     selectedNodeId,
     tagCountByNodeId,
+    pinnedNodeIds,
+    onPinToggle,
     onNodeClick,
     emptyHint,
     loading,
@@ -917,9 +984,13 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
   );
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const layoutRef = useRef<LayoutNode[]>([]);
+  const pinnedNodeIdsRef = useRef(pinnedNodeIds);
+  pinnedNodeIdsRef.current = pinnedNodeIds;
+  const onPinToggleRef = useRef(onPinToggle);
+  onPinToggleRef.current = onPinToggle;
   const collapsedGraph = useMemo(
-    () => collapseDenseSimilarNodes(nodes, edges, selectedNodeId),
-    [nodes, edges, selectedNodeId]
+    () => collapseDenseSimilarNodes(nodes, edges, selectedNodeId, pinnedNodeIds),
+    [nodes, edges, selectedNodeId, pinnedNodeIds]
   );
   const visibleNodes = collapsedGraph.nodes;
   const visibleEdges = collapsedGraph.edges;
@@ -1078,7 +1149,15 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
       };
     }
 
-    paintDiagramNodes(ctx, layout, sel, tagCountRef.current, clusterMetaRef.current, palette);
+    paintDiagramNodes(
+      ctx,
+      layout,
+      sel,
+      tagCountRef.current,
+      clusterMetaRef.current,
+      palette,
+      pinnedNodeIdsRef.current
+    );
     paintDiagramEdges(ctx, edgePolylines, {
       hideHalo: heavyModeRef.current,
       lowQuality: heavyModeRef.current || edgePolylines.length >= LOW_QUALITY_SPLINE_EDGE_THRESHOLD,
@@ -1091,14 +1170,14 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
     paintClusterInnerMiniCards(ctx, layout, clusterMetaRef.current, palette);
 
     ctx.restore();
-  }, [visibleEdges, simToLayout, focusNodeId, palette]);
+  }, [visibleEdges, simToLayout, focusNodeId, palette, pinnedNodeIds]);
 
   const drawRef = useRef(draw);
   drawRef.current = draw;
 
   useEffect(() => {
     drawRef.current();
-  }, [palette]);
+  }, [palette, pinnedNodeIds]);
 
   useImperativeHandle(
     ref,
@@ -1123,7 +1202,15 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
         ctx.translate(bounds.offsetX, bounds.offsetY);
 
         const sel = selectedIdRef.current;
-        paintDiagramNodes(ctx, layout, sel, tagCountRef.current, clusterMetaRef.current, palette);
+        paintDiagramNodes(
+          ctx,
+          layout,
+          sel,
+          tagCountRef.current,
+          clusterMetaRef.current,
+          palette,
+          pinnedNodeIdsRef.current
+        );
         paintDiagramEdges(ctx, edgePolylines, { edgeDotted, palette });
         placedLabels.forEach((g) => drawEdgeLabelPill(ctx, g, palette));
         paintClusterInnerMiniCards(ctx, layout, clusterMetaRef.current, palette);
@@ -1240,6 +1327,20 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
         const a = document.createElement('a');
         a.href = url;
         a.download = 'archmap-diagram.json';
+        a.click();
+        URL.revokeObjectURL(url);
+      },
+      exportPlantUml: () => {
+        const layout = simToLayout(simNodesRef.current);
+        const nodes = layout.map((ln) => ln.node);
+        const edges = edgesRef.current;
+        if (nodes.length === 0) return;
+        const text = buildPlantUmlComponentDiagram(nodes, edges);
+        const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'archmap-diagram.puml';
         a.click();
         URL.revokeObjectURL(url);
       },
@@ -1483,11 +1584,22 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
 
   useEffect(() => {
     drawRef.current();
-  }, [selectedVisibleId, focusNodeId, tagCountByNodeId]);
+  }, [selectedVisibleId, focusNodeId, tagCountByNodeId, pinnedNodeIds]);
 
   const handleMouseDown = (e: React.MouseEvent) => {
-    dragRef.current = { dragging: true, lastX: e.clientX, lastY: e.clientY };
     const canvas = canvasRef.current;
+    if (canvas && onPinToggleRef.current && pinnedNodeIdsRef.current !== undefined) {
+      const rect = canvas.getBoundingClientRect();
+      const x = (e.clientX - rect.left - panRef.current.x) / zoomRef.current;
+      const y = (e.clientY - rect.top - panRef.current.y) / zoomRef.current;
+      const hit = layoutRef.current.find(
+        (ln) => x >= ln.x && x <= ln.x + ln.width && y >= ln.y && y <= ln.y + ln.height
+      );
+      if (hit && !isClusterNode(hit.node) && hitTestPinToggle(hit, x, y)) {
+        return;
+      }
+    }
+    dragRef.current = { dragging: true, lastX: e.clientX, lastY: e.clientY };
     if (canvas) canvas.style.cursor = 'grabbing';
   };
 
@@ -1548,6 +1660,14 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
       canvas.style.cursor = 'grab';
       return;
     }
+    if (
+      pinnedNodeIdsRef.current !== undefined &&
+      !isClusterNode(hovered.node) &&
+      hitTestPinToggle(hovered, x, y)
+    ) {
+      canvas.style.cursor = 'pointer';
+      return;
+    }
     if (!isClusterNode(hovered.node)) {
       canvas.style.cursor = 'pointer';
       return;
@@ -1571,6 +1691,16 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
       (ln) => x >= ln.x && x <= ln.x + ln.width && y >= ln.y && y <= ln.y + ln.height
     );
     if (clicked) {
+      if (
+        onPinToggleRef.current &&
+        pinnedNodeIdsRef.current !== undefined &&
+        !isClusterNode(clicked.node) &&
+        hitTestPinToggle(clicked, x, y)
+      ) {
+        const pinned = pinnedNodeIdsRef.current.has(clicked.node.id);
+        onPinToggleRef.current(clicked.node, !pinned);
+        return;
+      }
       // Клик по "объединяющему" пунктирному прямоугольнику (cluster) игнорируем.
       // Drilldown должен происходить только по исходным узлам, не по агрегатам.
       if (isClusterNode(clicked.node)) {

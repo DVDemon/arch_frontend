@@ -37,6 +37,60 @@ type GraphData = {
 
 const TAG_STORAGE_KEY = "archmap-node-tags-v1";
 const MAX_NODE_TAG_LENGTH = 128;
+const PINNED_STORAGE_PREFIX = "archmap-pinned-v1-";
+
+/** Верхняя граница длины пути в shortestPath: при меньшем значении длинные цепочки в графе не попадают в выборку. */
+const SHORTEST_PATH_MAX_HOPS = 120;
+
+type PinnedEntry = { id: string; name: string; labels: string[] };
+
+function loadPinnedEntries(productAlias: string): PinnedEntry[] {
+  if (typeof window === "undefined") return [];
+  try {
+    const raw = localStorage.getItem(PINNED_STORAGE_PREFIX + productAlias);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(
+      (x): x is PinnedEntry =>
+        x != null &&
+        typeof x === "object" &&
+        typeof (x as PinnedEntry).id === "string" &&
+        typeof (x as PinnedEntry).name === "string" &&
+        Array.isArray((x as PinnedEntry).labels)
+    );
+  } catch {
+    return [];
+  }
+}
+
+function persistPinnedEntries(productAlias: string, entries: PinnedEntry[]) {
+  try {
+    localStorage.setItem(PINNED_STORAGE_PREFIX + productAlias, JSON.stringify(entries));
+  } catch {
+    // ignore
+  }
+}
+
+function enumeratePinnedPairs(selectedId: string, pinnedIds: string[]): Array<[string, string]> {
+  const ids = [...new Set([selectedId, ...pinnedIds])];
+  const pairs: Array<[string, string]> = [];
+  for (let i = 0; i < ids.length; i++) {
+    for (let j = i + 1; j < ids.length; j++) {
+      pairs.push([ids[i]!, ids[j]!]);
+    }
+  }
+  return pairs;
+}
+
+function c4NodeFromPinnedEntry(e: PinnedEntry): C4Node {
+  return {
+    id: e.id,
+    name: e.name,
+    labels: [...e.labels],
+    properties: { name: e.name },
+  };
+}
 
 const KNOWN_LABELS = [
   "SoftwareSystem",
@@ -197,6 +251,16 @@ function dedupeGraphEdges(edges: GraphEdge[]): GraphEdge[] {
   return out;
 }
 
+function mergeGraphData(a: GraphData, b: GraphData): GraphData {
+  const map = new Map<string, C4Node>();
+  for (const n of a.nodes) map.set(n.id, n);
+  for (const n of b.nodes) map.set(n.id, n);
+  return {
+    nodes: Array.from(map.values()),
+    edges: dedupeGraphEdges([...a.edges, ...b.edges]),
+  };
+}
+
 async function executeCypher(query: string): Promise<Record<string, unknown>[]> {
   const res = await fetch("/api/graph/cypher", {
     method: "POST",
@@ -255,11 +319,15 @@ async function searchByLabelAndName(graphTag: GraphTag, label: C4Label, name?: s
   return parseNodesFromRows(rows, "n");
 }
 
-async function loadNeighborhoodSubgraph(node: C4Node, graphTag: GraphTag): Promise<GraphData> {
+function anchorWhereClause(node: C4Node, graphTag: GraphTag, alias: string): string {
   const mLabel = mainLabel(node.labels);
   const nodeName = escapeCypherString(node.name);
   const label = escapeCypherString(mLabel);
-  const where = `anchor.name = '${nodeName}' AND '${label}' IN labels(anchor) AND ${graphTagPredicate("anchor", graphTag)}`;
+  return `${alias}.name = '${nodeName}' AND '${label}' IN labels(${alias}) AND ${graphTagPredicate(alias, graphTag)}`;
+}
+
+async function loadNeighborhoodSubgraph(node: C4Node, graphTag: GraphTag): Promise<GraphData> {
+  const where = anchorWhereClause(node, graphTag, "anchor");
   // 1-hop соседи, затем все рёбра между узлами {anchor} ∪ соседи. Пары без дубля: id() (совместимо с Neo4j 4/5).
   const query = `
 MATCH (anchor)
@@ -281,6 +349,53 @@ LIMIT 800
     executeCypher(query),
   ]);
   return parseGraphFromRows([...anchorRows, ...edgeRows]);
+}
+
+async function loadMergedSubgraph(
+  selected: C4Node,
+  graphTag: GraphTag,
+  pinnedEntries: PinnedEntry[]
+): Promise<GraphData> {
+  const base = await loadNeighborhoodSubgraph(selected, graphTag);
+  if (pinnedEntries.length === 0) return base;
+
+  const pinnedMap = new Map(pinnedEntries.map((e) => [e.id, e]));
+  const pairs = enumeratePinnedPairs(selected.id, pinnedEntries.map((p) => p.id));
+
+  const resolveNodeForQuery = (id: string): C4Node | null => {
+    if (id === selected.id) return selected;
+    const fromBase = base.nodes.find((n) => n.id === id);
+    if (fromBase) return fromBase;
+    const e = pinnedMap.get(id);
+    return e ? c4NodeFromPinnedEntry(e) : null;
+  };
+
+  const parts = await Promise.all(
+    pairs.map(async ([idA, idB]) => {
+      const nodeA = resolveNodeForQuery(idA);
+      const nodeB = resolveNodeForQuery(idB);
+      if (!nodeA || !nodeB) return { nodes: [], edges: [] };
+      const q = `
+MATCH (a) WHERE ${anchorWhereClause(nodeA, graphTag, "a")}
+MATCH (b) WHERE ${anchorWhereClause(nodeB, graphTag, "b")}
+MATCH p = shortestPath((a)-[*..${SHORTEST_PATH_MAX_HOPS}]-(b))
+UNWIND relationships(p) AS r
+RETURN startNode(r) AS n, r, endNode(r) AS m
+`.trim();
+      try {
+        const rows = await executeCypher(q);
+        return parseGraphFromRows(rows);
+      } catch {
+        return { nodes: [], edges: [] };
+      }
+    })
+  );
+
+  let merged = base;
+  for (const p of parts) {
+    merged = mergeGraphData(merged, p);
+  }
+  return merged;
 }
 
 export default function ProductArchMapTab({
@@ -316,6 +431,13 @@ export default function ProductArchMapTab({
   });
   const [newTag, setNewTag] = useState("");
   const graphRef = useRef<GraphCanvasHandle>(null);
+  const [pinnedEntries, setPinnedEntries] = useState<PinnedEntry[]>(() => loadPinnedEntries(productAlias));
+  const pinnedEntriesRef = useRef(pinnedEntries);
+  pinnedEntriesRef.current = pinnedEntries;
+
+  useEffect(() => {
+    setPinnedEntries(loadPinnedEntries(productAlias));
+  }, [productAlias]);
 
   const persistTags = useCallback((next: Record<string, string[]>) => {
     setTagsState(next);
@@ -348,7 +470,7 @@ export default function ProductArchMapTab({
         setSelectedNode(null);
         return;
       }
-      const subgraph = await loadNeighborhoodSubgraph(exact, graphTag);
+      const subgraph = await loadMergedSubgraph(exact, graphTag, pinnedEntriesRef.current);
       setGraph(subgraph);
       setSelectedNode(exact);
     } catch (e) {
@@ -367,7 +489,7 @@ export default function ProductArchMapTab({
       setGraphLoading(true);
       setError(null);
       try {
-        const subgraph = await loadNeighborhoodSubgraph(node, graphTag);
+        const subgraph = await loadMergedSubgraph(node, graphTag, pinnedEntriesRef.current);
         setGraph(subgraph);
         setSelectedNode(node);
       } catch (e) {
@@ -379,6 +501,61 @@ export default function ProductArchMapTab({
     [graphTag]
   );
 
+  const refetchGraphForPins = useCallback(
+    async (nextPins: PinnedEntry[]) => {
+      if (!selectedNode) return;
+      setGraphLoading(true);
+      setError(null);
+      try {
+        const g = await loadMergedSubgraph(selectedNode, graphTag, nextPins);
+        setGraph(g);
+      } catch (e) {
+        setError(e instanceof Error ? e.message : "Ошибка загрузки диаграммы");
+      } finally {
+        setGraphLoading(false);
+      }
+    },
+    [selectedNode, graphTag]
+  );
+
+  const handlePinToggle = useCallback(
+    (node: C4Node, pinned: boolean) => {
+      setPinnedEntries((prev) => {
+        let next: PinnedEntry[];
+        if (pinned) {
+          if (prev.some((p) => p.id === node.id)) return prev;
+          next = [...prev, { id: node.id, name: node.name, labels: [...node.labels] }];
+        } else {
+          if (!prev.some((p) => p.id === node.id)) return prev;
+          next = prev.filter((p) => p.id !== node.id);
+        }
+        persistPinnedEntries(productAlias, next);
+        pinnedEntriesRef.current = next;
+        requestAnimationFrame(() => {
+          void refetchGraphForPins(pinnedEntriesRef.current);
+        });
+        return next;
+      });
+    },
+    [productAlias, refetchGraphForPins]
+  );
+
+  const handleUnpin = useCallback(
+    (id: string) => {
+      setPinnedEntries((prev) => {
+        if (!prev.some((p) => p.id === id)) return prev;
+        const next = prev.filter((p) => p.id !== id);
+        persistPinnedEntries(productAlias, next);
+        pinnedEntriesRef.current = next;
+        requestAnimationFrame(() => {
+          void refetchGraphForPins(pinnedEntriesRef.current);
+        });
+        return next;
+      });
+    },
+    [productAlias, refetchGraphForPins]
+  );
+
   const graphData = useMemo(() => {
     let nodes = graph.nodes as ArchNode[];
     let edges = graph.edges as ArchEdge[];
@@ -386,18 +563,25 @@ export default function ProductArchMapTab({
       const selectedLabels = new Set(selectedNode.labels);
       const isDeploymentEnvironment =
         selectedLabels.has("DeploymentEnvironment") || selectedLabels.has("Environment");
+      // С прикреплениями merged-граф содержит цепочки shortestPath; filterDirectNeighborhood оставляет
+      // только 1-hop от якоря и выкидывает промежуточные узлы пути к прикреплённым.
+      const skipLocalNeighborhoodFilter = pinnedEntries.length > 0;
       if (isDeploymentEnvironment) {
-        const f = filterDeploymentEnvironmentNeighborhood(graph, selectedNode.id);
-        nodes = f.nodes as ArchNode[];
-        edges = f.edges as ArchEdge[];
+        if (!skipLocalNeighborhoodFilter) {
+          const f = filterDeploymentEnvironmentNeighborhood(graph, selectedNode.id);
+          nodes = f.nodes as ArchNode[];
+          edges = f.edges as ArchEdge[];
+        }
       } else if (!selectedLabels.has("SoftwareSystem")) {
-        const f = filterDirectNeighborhood(graph, selectedNode.id);
-        nodes = f.nodes as ArchNode[];
-        edges = f.edges as ArchEdge[];
+        if (!skipLocalNeighborhoodFilter) {
+          const f = filterDirectNeighborhood(graph, selectedNode.id);
+          nodes = f.nodes as ArchNode[];
+          edges = f.edges as ArchEdge[];
+        }
       }
     }
     return { nodes, edges };
-  }, [graph.edges, graph.nodes, selectedNode]);
+  }, [graph.edges, graph.nodes, selectedNode, pinnedEntries.length]);
 
   const visibleTypeSet = useMemo(() => {
     const out = new Set<C4Label>();
@@ -441,6 +625,8 @@ export default function ProductArchMapTab({
     }
     return m;
   }, [tagsState]);
+
+  const pinnedIdSet = useMemo(() => new Set(pinnedEntries.map((p) => p.id)), [pinnedEntries]);
 
   return (
     <div className="flex h-full overflow-hidden rounded-xl border border-zinc-200 dark:border-zinc-700">
@@ -525,8 +711,61 @@ export default function ProductArchMapTab({
                     <path strokeLinecap="round" strokeLinejoin="round" d="M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5a3.375 3.375 0 00-3.375-3.375H8.25m0 12.75h7.5m-7.5 3H12M10.5 2.25H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 00-9-9z" />
                   </svg>
                 </button>
+                <button
+                  type="button"
+                  onClick={() => graphRef.current?.exportPlantUml()}
+                  className="rounded-md border border-zinc-300 p-2 text-zinc-700 hover:bg-zinc-100 dark:border-zinc-600 dark:text-zinc-200 dark:hover:bg-zinc-700/60"
+                  title="Экспорт PlantUML (component diagram)"
+                  aria-label="Экспорт диаграммы в PlantUML"
+                >
+                  <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" aria-hidden>
+                    <rect
+                      x="2.5"
+                      y="4"
+                      width="19"
+                      height="16"
+                      rx="2"
+                      stroke="currentColor"
+                      strokeWidth={1.5}
+                    />
+                    <text
+                      x="12"
+                      y="15.25"
+                      textAnchor="middle"
+                      fill="currentColor"
+                      stroke="none"
+                      fontSize="7"
+                      fontWeight={700}
+                      fontFamily="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace"
+                    >
+                      PUML
+                    </text>
+                  </svg>
+                </button>
               </div>
             </div>
+
+            {pinnedEntries.length > 0 && (
+              <div className="flex shrink-0 flex-col gap-1 rounded-md border border-zinc-200 bg-white px-3 py-2 dark:border-zinc-700 dark:bg-zinc-900">
+                <div className="text-xs font-semibold text-zinc-700 dark:text-zinc-300">Прикреплённые</div>
+                <ul className="max-h-32 space-y-1 overflow-y-auto">
+                  {pinnedEntries.map((p) => (
+                    <li key={p.id} className="flex items-start justify-between gap-2 text-xs">
+                      <span className="min-w-0 flex-1 truncate text-zinc-800 dark:text-zinc-200" title={p.name}>
+                        {p.name}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => handleUnpin(p.id)}
+                        className="shrink-0 text-amber-700 hover:underline dark:text-amber-400"
+                      >
+                        Открепить
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
 
             <div className="flex shrink-0 flex-col gap-1 rounded-md border border-zinc-200 bg-white px-3 py-2 dark:border-zinc-700 dark:bg-zinc-900">
               <div className="text-xs font-semibold text-zinc-700 dark:text-zinc-300">Типы</div>
@@ -616,6 +855,8 @@ export default function ProductArchMapTab({
             focusNodeId={selectedNode?.id ?? null}
             selectedNodeId={selectedNode?.id ?? null}
             tagCountByNodeId={tagCountByNodeId}
+            pinnedNodeIds={pinnedIdSet}
+            onPinToggle={handlePinToggle}
             onNodeClick={(node) => void openNode(node as C4Node)}
             loading={graphLoading}
           />
