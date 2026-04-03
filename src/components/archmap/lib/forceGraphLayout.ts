@@ -9,7 +9,7 @@ import {
   type SimulationLinkDatum,
   type SimulationNodeDatum,
 } from 'd3-force';
-import type { C4Node, GraphEdge } from '../types/c4';
+import { nodeDisplayName, type C4Node, type GraphEdge } from '../types/c4';
 import { GRID_CELL, snapSizeToGrid } from './astarGridRouter';
 
 /** Целевые размеры карточки; приводятся к кратным шагу сетки A* (см. GRID_CELL). */
@@ -150,7 +150,7 @@ function placeNodesOnSemicircle({
 
 function sortNodesByName(nodes: SimNode[]): SimNode[] {
   return [...nodes].sort((a, b) =>
-    a.node.name.localeCompare(b.node.name, undefined, { sensitivity: 'base' })
+    nodeDisplayName(a.node).localeCompare(nodeDisplayName(b.node), undefined, { sensitivity: 'base' })
   );
 }
 
@@ -194,7 +194,7 @@ function computeTierContentHeight(tierNodes: SimNode[]): number {
   if (tierNodes.length === 0) return 0;
   const minGap = GRID_CELL;
   const sorted = [...tierNodes].sort((a, b) =>
-    a.node.name.localeCompare(b.node.name, undefined, { sensitivity: 'base' })
+    nodeDisplayName(a.node).localeCompare(nodeDisplayName(b.node), undefined, { sensitivity: 'base' })
   );
   const maxW = sorted.reduce((m, n) => Math.max(m, n.width), NODE_W);
   const maxH = sorted.reduce((m, n) => Math.max(m, n.height), NODE_H);
@@ -207,7 +207,7 @@ function computeTierContentHeight(tierNodes: SimNode[]): number {
 function placeTierWithoutOverlap(tierNodes: SimNode[], centerX: number, baseY: number): void {
   if (tierNodes.length === 0) return;
   const sorted = [...tierNodes].sort((a, b) =>
-    a.node.name.localeCompare(b.node.name, undefined, { sensitivity: 'base' })
+    nodeDisplayName(a.node).localeCompare(nodeDisplayName(b.node), undefined, { sensitivity: 'base' })
   );
   const minGap = GRID_CELL;
   const maxW = sorted.reduce((m, n) => Math.max(m, n.width), NODE_W);
@@ -718,8 +718,8 @@ function createDeploymentEnvironmentTreeLayout(
     .map((n) => n.id)
     .filter((id) => !depth.has(id))
     .sort((a, b) => {
-      const an = simById.get(a)!.node.name;
-      const bn = simById.get(b)!.node.name;
+      const an = nodeDisplayName(simById.get(a)!.node);
+      const bn = nodeDisplayName(simById.get(b)!.node);
       return an.localeCompare(bn, undefined, { sensitivity: 'base' });
     });
   const maxDepth = depth.size > 0 ? Math.max(...depth.values()) : 0;
@@ -747,7 +747,7 @@ function createDeploymentEnvironmentTreeLayout(
   for (const d of orderedDepths) {
     if (d === 0) continue;
     const levelNodes = (levels.get(d) ?? []).sort((a, b) =>
-      a.node.name.localeCompare(b.node.name, undefined, { sensitivity: 'base' })
+      nodeDisplayName(a.node).localeCompare(nodeDisplayName(b.node), undefined, { sensitivity: 'base' })
     );
     if (levelNodes.length === 0) continue;
     const gap = 40;

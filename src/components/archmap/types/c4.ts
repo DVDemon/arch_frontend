@@ -20,6 +20,14 @@ export interface C4Node {
   technology?: string;
 }
 
+/** Подпись на диаграмме: приоритетно `originalName` из Neo4j, иначе `name`. */
+export function nodeDisplayName(n: C4Node): string {
+  const p = n.properties as Record<string, unknown>;
+  const raw = p.originalName ?? p.original_name;
+  if (typeof raw === 'string' && raw.trim().length > 0) return raw.trim();
+  return n.name;
+}
+
 export interface C4Relationship {
   id: string;
   type: string;

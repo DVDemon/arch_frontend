@@ -1,4 +1,5 @@
 import { C4_COLORS } from '../types/c4';
+import { clusterMemberOffsetKey } from '../types/diagramLayout';
 import { GRID_CELL, type Point } from './astarGridRouter';
 import { getDiagramPalette, type DiagramPalette } from './diagramTheme';
 
@@ -12,7 +13,7 @@ const CLUSTER_BOX_PADDING = GRID_CELL;
 export interface ClusterExportForSvg {
   memberType: string;
   edgeLabel: string;
-  members: { name: string }[];
+  members: { name: string; id: string }[];
 }
 
 const KNOWN = [
@@ -96,6 +97,8 @@ export function buildDiagramSvgString(options: {
   palette?: DiagramPalette;
   /** Схлопнутые группы: id узла-кластера → состав (как на canvas). */
   clusters?: Record<string, ClusterExportForSvg>;
+  /** Смещения мини-карточек в группе (ключ `clusterId::memberId`). */
+  clusterMemberOffsets?: Record<string, { dx: number; dy: number }>;
 }): string {
   const {
     width,
@@ -110,6 +113,7 @@ export function buildDiagramSvgString(options: {
     tagCounts,
     palette: paletteOpt,
     clusters,
+    clusterMemberOffsets,
   } = options;
   const pal = paletteOpt ?? getDiagramPalette(false);
   const parts: string[] = [];
@@ -251,8 +255,11 @@ export function buildDiagramSvgString(options: {
       cm.members.forEach((member, idx) => {
         const col = idx % cols;
         const row = Math.floor(idx / cols);
-        const mx = innerStartX + col * (CLUSTER_MEMBER_W + GRID_CELL);
-        const my = innerStartY + row * (CLUSTER_MEMBER_H + GRID_CELL);
+        const mx0 = innerStartX + col * (CLUSTER_MEMBER_W + GRID_CELL);
+        const my0 = innerStartY + row * (CLUSTER_MEMBER_H + GRID_CELL);
+        const off = clusterMemberOffsets?.[clusterMemberOffsetKey(ln.id, member.id)] ?? { dx: 0, dy: 0 };
+        const mx = mx0 + off.dx;
+        const my = my0 + off.dy;
         const shortName =
           member.name.length > 14 ? `${member.name.slice(0, 12)}...` : member.name;
         parts.push(

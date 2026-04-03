@@ -2,7 +2,12 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { GraphCanvas, type GraphCanvasHandle } from "@/components/archmap/components/GraphCanvas";
-import type { C4Node as ArchNode, GraphEdge as ArchEdge } from "@/components/archmap/types/c4";
+import {
+  nodeDisplayName,
+  type C4Node as ArchNode,
+  type GraphEdge as ArchEdge,
+} from "@/components/archmap/types/c4";
+import type { DiagramLayoutPersist } from "@/components/archmap/types/diagramLayout";
 
 type GraphTag = "Global" | "Local" | "All";
 type C4Label =
@@ -35,14 +40,75 @@ type GraphData = {
   edges: GraphEdge[];
 };
 
+/** Снимок для «Назад» по навигации по диаграмме. */
+type DiagramSnapshot = {
+  graph: GraphData;
+  selectedNode: C4Node;
+  /** Раскладка на момент ухода с диаграммы (в т.ч. несохранённая в localStorage). */
+  diagramLayout?: DiagramLayoutPersist | null;
+};
+
+function cloneGraphData(g: GraphData): GraphData {
+  return {
+    nodes: g.nodes.map((n) => ({
+      ...n,
+      labels: [...n.labels],
+      properties: { ...(n.properties as Record<string, unknown>) },
+    })),
+    edges: g.edges.map((e) => ({ ...e })),
+  };
+}
+
+function cloneC4Node(n: C4Node): C4Node {
+  return {
+    ...n,
+    labels: [...n.labels],
+    properties: { ...(n.properties as Record<string, unknown>) },
+  };
+}
+
 const TAG_STORAGE_KEY = "archmap-node-tags-v1";
 const MAX_NODE_TAG_LENGTH = 128;
 const PINNED_STORAGE_PREFIX = "archmap-pinned-v1-";
+const LAYOUT_STORAGE_PREFIX = "archmap-layout-v2-";
+
+function layoutStorageKey(productAlias: string, anchorNodeId: string) {
+  return `${LAYOUT_STORAGE_PREFIX}${productAlias}::${anchorNodeId}`;
+}
+
+function loadDiagramLayout(key: string): DiagramLayoutPersist | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== "object") return null;
+    const o = parsed as Record<string, unknown>;
+    const np = o.nodePositions;
+    const cm = o.clusterMemberOffsets;
+    if (!np || typeof np !== "object") return null;
+    return {
+      nodePositions: np as DiagramLayoutPersist["nodePositions"],
+      clusterMemberOffsets:
+        cm && typeof cm === "object" ? (cm as DiagramLayoutPersist["clusterMemberOffsets"]) : {},
+    };
+  } catch {
+    return null;
+  }
+}
+
+function saveDiagramLayout(key: string, data: DiagramLayoutPersist) {
+  try {
+    localStorage.setItem(key, JSON.stringify(data));
+  } catch {
+    // ignore
+  }
+}
 
 /** Верхняя граница длины пути в shortestPath: при меньшем значении длинные цепочки в графе не попадают в выборку. */
 const SHORTEST_PATH_MAX_HOPS = 120;
 
-type PinnedEntry = { id: string; name: string; labels: string[] };
+type PinnedEntry = { id: string; name: string; labels: string[]; originalName?: string };
 
 function loadPinnedEntries(productAlias: string): PinnedEntry[] {
   if (typeof window === "undefined") return [];
@@ -57,7 +123,9 @@ function loadPinnedEntries(productAlias: string): PinnedEntry[] {
         typeof x === "object" &&
         typeof (x as PinnedEntry).id === "string" &&
         typeof (x as PinnedEntry).name === "string" &&
-        Array.isArray((x as PinnedEntry).labels)
+        Array.isArray((x as PinnedEntry).labels) &&
+        ((x as PinnedEntry).originalName == null ||
+          typeof (x as PinnedEntry).originalName === "string")
     );
   } catch {
     return [];
@@ -84,12 +152,20 @@ function enumeratePinnedPairs(selectedId: string, pinnedIds: string[]): Array<[s
 }
 
 function c4NodeFromPinnedEntry(e: PinnedEntry): C4Node {
+  const properties: Record<string, unknown> = { name: e.name };
+  if (typeof e.originalName === "string" && e.originalName.trim()) {
+    properties.originalName = e.originalName.trim();
+  }
   return {
     id: e.id,
     name: e.name,
     labels: [...e.labels],
-    properties: { name: e.name },
+    properties,
   };
+}
+
+function pinnedEntryDisplayName(e: PinnedEntry): string {
+  return nodeDisplayName(c4NodeFromPinnedEntry(e) as ArchNode);
 }
 
 const KNOWN_LABELS = [
@@ -410,8 +486,17 @@ export default function ProductArchMapTab({
   const [graphLoading, setGraphLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [graph, setGraph] = useState<GraphData>({ nodes: [], edges: [] });
+  const graphDataRef = useRef(graph);
+  graphDataRef.current = graph;
   const [selectedNode, setSelectedNode] = useState<C4Node | null>(null);
+  const selectedNodeRef = useRef(selectedNode);
+  selectedNodeRef.current = selectedNode;
   const [diagramNameFilter, setDiagramNameFilter] = useState("");
+  const [diagramInteractionMode, setDiagramInteractionMode] = useState<"view" | "edit">("view");
+  const [diagramLayout, setDiagramLayout] = useState<DiagramLayoutPersist | null>(null);
+  const diagramLayoutRef = useRef<DiagramLayoutPersist | null>(null);
+  diagramLayoutRef.current = diagramLayout;
+  const [diagramHistory, setDiagramHistory] = useState<DiagramSnapshot[]>([]);
   const [typeVisibility, setTypeVisibility] = useState<Record<C4Label, boolean>>(() => {
     const m = {} as Record<C4Label, boolean>;
     for (const l of KNOWN_LABELS) m[l as C4Label] = true;
@@ -438,6 +523,19 @@ export default function ProductArchMapTab({
   useEffect(() => {
     setPinnedEntries(loadPinnedEntries(productAlias));
   }, [productAlias]);
+
+  useEffect(() => {
+    setDiagramHistory([]);
+  }, [productAlias]);
+
+  const handleLayoutPersist = useCallback(
+    (layout: DiagramLayoutPersist) => {
+      if (!selectedNode) return;
+      setDiagramLayout(layout);
+      saveDiagramLayout(layoutStorageKey(productAlias, selectedNode.id), layout);
+    },
+    [productAlias, selectedNode?.id]
+  );
 
   const persistTags = useCallback((next: Record<string, string[]>) => {
     setTagsState(next);
@@ -468,9 +566,11 @@ export default function ProductArchMapTab({
       if (!exact) {
         setGraph({ nodes: [], edges: [] });
         setSelectedNode(null);
+        setDiagramLayout(null);
         return;
       }
       const subgraph = await loadMergedSubgraph(exact, graphTag, pinnedEntriesRef.current);
+      setDiagramLayout(loadDiagramLayout(layoutStorageKey(productAlias, exact.id)));
       setGraph(subgraph);
       setSelectedNode(exact);
     } catch (e) {
@@ -486,10 +586,23 @@ export default function ProductArchMapTab({
 
   const openNode = useCallback(
     async (node: C4Node) => {
+      const g = graphDataRef.current;
+      const s = selectedNodeRef.current;
+      if (s != null && g.nodes.length > 0) {
+        setDiagramHistory((h) => [
+          ...h,
+          {
+            graph: cloneGraphData(g),
+            selectedNode: cloneC4Node(s),
+            diagramLayout: diagramLayoutRef.current,
+          },
+        ]);
+      }
       setGraphLoading(true);
       setError(null);
       try {
         const subgraph = await loadMergedSubgraph(node, graphTag, pinnedEntriesRef.current);
+        setDiagramLayout(loadDiagramLayout(layoutStorageKey(productAlias, node.id)));
         setGraph(subgraph);
         setSelectedNode(node);
       } catch (e) {
@@ -498,7 +611,34 @@ export default function ProductArchMapTab({
         setGraphLoading(false);
       }
     },
-    [graphTag]
+    [graphTag, productAlias]
+  );
+
+  const handleDiagramBack = useCallback(() => {
+    setDiagramHistory((prev) => {
+      if (prev.length === 0) return prev;
+      const entry = prev[prev.length - 1]!;
+      const layout =
+        entry.diagramLayout ??
+        loadDiagramLayout(layoutStorageKey(productAlias, entry.selectedNode.id));
+      setGraph(entry.graph);
+      setSelectedNode(entry.selectedNode);
+      setDiagramLayout(layout);
+      return prev.slice(0, -1);
+    });
+  }, [productAlias]);
+
+  const handleGraphNodeClick = useCallback(
+    (node: C4Node) => {
+      if (diagramInteractionMode === "view") {
+        setSelectedNode(node);
+        void openNode(node);
+      } else {
+        setDiagramLayout(loadDiagramLayout(layoutStorageKey(productAlias, node.id)));
+        setSelectedNode(node);
+      }
+    },
+    [diagramInteractionMode, openNode, productAlias]
   );
 
   const refetchGraphForPins = useCallback(
@@ -524,7 +664,19 @@ export default function ProductArchMapTab({
         let next: PinnedEntry[];
         if (pinned) {
           if (prev.some((p) => p.id === node.id)) return prev;
-          next = [...prev, { id: node.id, name: node.name, labels: [...node.labels] }];
+          const props = node.properties as Record<string, unknown>;
+          const origRaw = props.originalName ?? props.original_name;
+          const originalName =
+            typeof origRaw === "string" && origRaw.trim() ? origRaw.trim() : undefined;
+          next = [
+            ...prev,
+            {
+              id: node.id,
+              name: node.name,
+              labels: [...node.labels],
+              ...(originalName ? { originalName } : {}),
+            },
+          ];
         } else {
           if (!prev.some((p) => p.id === node.id)) return prev;
           next = prev.filter((p) => p.id !== node.id);
@@ -606,7 +758,9 @@ export default function ProductArchMapTab({
   const displayedNodes = useMemo(
     () =>
       [...(visibleGraphData.nodes as C4Node[])].sort((a, b) =>
-        a.name.localeCompare(b.name, undefined, { sensitivity: "base" })
+        nodeDisplayName(a as ArchNode).localeCompare(nodeDisplayName(b as ArchNode), undefined, {
+          sensitivity: "base",
+        })
       ),
     [visibleGraphData.nodes]
   );
@@ -614,7 +768,7 @@ export default function ProductArchMapTab({
   const filteredDisplayedNodes = useMemo(() => {
     const q = diagramNameFilter.trim().toLowerCase();
     if (!q) return displayedNodes;
-    return displayedNodes.filter((n) => n.name.toLowerCase().includes(q));
+    return displayedNodes.filter((n) => nodeDisplayName(n as ArchNode).toLowerCase().includes(q));
   }, [displayedNodes, diagramNameFilter]);
 
   const selectedTags = selectedNode ? tagsState[selectedNode.id] ?? [] : [];
@@ -643,116 +797,17 @@ export default function ProductArchMapTab({
         </button>
         {!leftCollapsed && (
           <div className="flex min-h-0 flex-1 flex-col gap-2">
-            <div className="flex shrink-0 items-center justify-center gap-1 border-b border-zinc-200 pb-2 dark:border-zinc-700">
-              <button
-                type="button"
-                onClick={() => graphRef.current?.zoomIn()}
-                className="rounded-md border border-zinc-300 p-2 text-zinc-700 hover:bg-zinc-100 dark:border-zinc-600 dark:text-zinc-200 dark:hover:bg-zinc-700/60"
-                title="Увеличить"
-                aria-label="Увеличить масштаб"
-              >
-                <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5} aria-hidden>
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M21 21l-5.197-5.197m0 0A7.5 7.5 0 105.196 5.196a7.5 7.5 0 0010.607 10.607zM10.5 7.5v6m3-3h-6" />
-                </svg>
-              </button>
-              <button
-                type="button"
-                onClick={() => graphRef.current?.zoomOut()}
-                className="rounded-md border border-zinc-300 p-2 text-zinc-700 hover:bg-zinc-100 dark:border-zinc-600 dark:text-zinc-200 dark:hover:bg-zinc-700/60"
-                title="Уменьшить"
-                aria-label="Уменьшить масштаб"
-              >
-                <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5} aria-hidden>
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M21 21l-5.197-5.197m0 0A7.5 7.5 0 105.196 5.196a7.5 7.5 0 0010.607 10.607zM13.5 10.5h-6" />
-                </svg>
-              </button>
-              <button
-                type="button"
-                onClick={() => graphRef.current?.fitToScreen()}
-                className="rounded-md border border-zinc-300 p-2 text-zinc-700 hover:bg-zinc-100 dark:border-zinc-600 dark:text-zinc-200 dark:hover:bg-zinc-700/60"
-                title="По размеру окна"
-                aria-label="Вписать диаграмму в экран"
-              >
-                <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5} aria-hidden>
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M3.75 3.75v4.5m0-4.5h4.5m-4.5 0L9 9M3.75 20.25v-4.5m0 4.5h4.5m-4.5 0L9 15M20.25 3.75h-4.5m4.5 0v4.5m0-4.5L15 9m5.25 11.25v-4.5m0 4.5h-4.5m4.5 0L15 15" />
-                </svg>
-              </button>
-              <div className="flex flex-wrap gap-1" role="group" aria-label="Экспорт диаграммы">
-                <button
-                  type="button"
-                  onClick={() => graphRef.current?.exportPng()}
-                  className="rounded-md border border-zinc-300 p-2 text-zinc-700 hover:bg-zinc-100 dark:border-zinc-600 dark:text-zinc-200 dark:hover:bg-zinc-700/60"
-                  title="Экспорт PNG"
-                  aria-label="Экспорт диаграммы в PNG"
-                >
-                  <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5} aria-hidden>
-                    <path strokeLinecap="round" strokeLinejoin="round" d="M2.25 15.75l5.159-5.159a2.25 2.25 0 013.182 0l5.159 5.159m-1.5-1.5l1.409-1.409a2.25 2.25 0 013.182 0l2.909 2.909m-18 3.75h16.5a1.5 1.5 0 001.5-1.5V6a1.5 1.5 0 00-1.5-1.5H3.75A1.5 1.5 0 002.25 6v12a1.5 1.5 0 001.5 1.5zm10.5-11.25h.008v.008h-.008V8.25zm.375 0a.375.375 0 11-.75 0 .375.375 0 01.75 0z" />
-                  </svg>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => graphRef.current?.exportSvg()}
-                  className="rounded-md border border-zinc-300 p-2 text-zinc-700 hover:bg-zinc-100 dark:border-zinc-600 dark:text-zinc-200 dark:hover:bg-zinc-700/60"
-                  title="Экспорт SVG"
-                  aria-label="Экспорт диаграммы в SVG"
-                >
-                  <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5} aria-hidden>
-                    <path strokeLinecap="round" strokeLinejoin="round" d="M17.25 6.75L22.5 12l-5.25 5.25m-10.5 0L1.5 12l5.25-5.25m7.5-3l-4.5 16.5" />
-                  </svg>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => graphRef.current?.exportJson()}
-                  className="rounded-md border border-zinc-300 p-2 text-zinc-700 hover:bg-zinc-100 dark:border-zinc-600 dark:text-zinc-200 dark:hover:bg-zinc-700/60"
-                  title="Экспорт JSON (узлы, рёбра, координаты)"
-                  aria-label="Экспорт диаграммы в JSON"
-                >
-                  <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5} aria-hidden>
-                    <path strokeLinecap="round" strokeLinejoin="round" d="M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5a3.375 3.375 0 00-3.375-3.375H8.25m0 12.75h7.5m-7.5 3H12M10.5 2.25H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 00-9-9z" />
-                  </svg>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => graphRef.current?.exportPlantUml()}
-                  className="rounded-md border border-zinc-300 p-2 text-zinc-700 hover:bg-zinc-100 dark:border-zinc-600 dark:text-zinc-200 dark:hover:bg-zinc-700/60"
-                  title="Экспорт PlantUML (component diagram)"
-                  aria-label="Экспорт диаграммы в PlantUML"
-                >
-                  <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" aria-hidden>
-                    <rect
-                      x="2.5"
-                      y="4"
-                      width="19"
-                      height="16"
-                      rx="2"
-                      stroke="currentColor"
-                      strokeWidth={1.5}
-                    />
-                    <text
-                      x="12"
-                      y="15.25"
-                      textAnchor="middle"
-                      fill="currentColor"
-                      stroke="none"
-                      fontSize="7"
-                      fontWeight={700}
-                      fontFamily="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace"
-                    >
-                      PUML
-                    </text>
-                  </svg>
-                </button>
-              </div>
-            </div>
-
             {pinnedEntries.length > 0 && (
               <div className="flex shrink-0 flex-col gap-1 rounded-md border border-zinc-200 bg-white px-3 py-2 dark:border-zinc-700 dark:bg-zinc-900">
                 <div className="text-xs font-semibold text-zinc-700 dark:text-zinc-300">Прикреплённые</div>
                 <ul className="max-h-32 space-y-1 overflow-y-auto">
                   {pinnedEntries.map((p) => (
                     <li key={p.id} className="flex items-start justify-between gap-2 text-xs">
-                      <span className="min-w-0 flex-1 truncate text-zinc-800 dark:text-zinc-200" title={p.name}>
-                        {p.name}
+                      <span
+                        className="min-w-0 flex-1 truncate text-zinc-800 dark:text-zinc-200"
+                        title={pinnedEntryDisplayName(p)}
+                      >
+                        {pinnedEntryDisplayName(p)}
                       </span>
                       <button
                         type="button"
@@ -812,7 +867,7 @@ export default function ProductArchMapTab({
                     <button
                       key={`graph-node-${node.id}`}
                       type="button"
-                      onClick={() => void openNode(node)}
+                      onClick={() => handleGraphNodeClick(node)}
                       className={`flex w-full flex-col items-start border-b border-zinc-100 px-3 py-2 text-left hover:bg-zinc-50 dark:border-zinc-800 dark:hover:bg-zinc-800/60 ${
                         isActive ? "bg-zinc-100 dark:bg-zinc-800/70" : ""
                       }`}
@@ -820,7 +875,9 @@ export default function ProductArchMapTab({
                       <span className="text-[10px] font-semibold" style={{ color: C4_COLORS[label] ?? "#777" }}>
                         [{label}]
                       </span>
-                      <span className="text-sm text-zinc-800 dark:text-zinc-200">{node.name}</span>
+                      <span className="text-sm text-zinc-800 dark:text-zinc-200">
+                        {nodeDisplayName(node as ArchNode)}
+                      </span>
                     </button>
                   );
                 })}
@@ -836,31 +893,185 @@ export default function ProductArchMapTab({
         )}
       </aside>
 
-      <main className="min-w-0 flex h-full flex-1 bg-zinc-100/60 dark:bg-zinc-900/40">
-        {graphLoading && (
-          <div className="flex h-full items-center justify-center text-zinc-500 dark:text-zinc-400">
-            Загрузка диаграммы...
+      <main className="flex min-h-0 min-w-0 flex-1 flex-col bg-zinc-100/60 dark:bg-zinc-900/40">
+        <div className="flex shrink-0 flex-wrap items-center justify-between gap-x-3 gap-y-2 border-b border-zinc-200 bg-white px-3 py-2.5 dark:border-zinc-700 dark:bg-zinc-900/95">
+          <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={handleDiagramBack}
+              disabled={diagramHistory.length === 0}
+              className="inline-flex shrink-0 items-center gap-1 rounded-md border border-zinc-300 px-2.5 py-1.5 text-xs font-semibold text-zinc-700 hover:bg-zinc-100 disabled:cursor-not-allowed disabled:opacity-40 dark:border-zinc-600 dark:text-zinc-200 dark:hover:bg-zinc-800"
+              title="Вернуться к предыдущей диаграмме"
+              aria-label="Назад к предыдущей диаграмме"
+            >
+              <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5} aria-hidden>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M10.5 19.5L3 12m0 0l7.5-7.5M3 12h18" />
+              </svg>
+              Назад
+            </button>
+            <span className="text-xs font-medium text-zinc-600 dark:text-zinc-300">Режим</span>
+            <div
+              className="inline-flex shrink-0 rounded-lg border border-zinc-300 p-0.5 shadow-sm dark:border-zinc-600"
+              role="group"
+              aria-label="Просмотр или редактирование"
+            >
+              <button
+                type="button"
+                onClick={() => setDiagramInteractionMode("view")}
+                className={`rounded-md px-3 py-1.5 text-sm font-semibold transition-colors ${
+                  diagramInteractionMode === "view"
+                    ? "bg-amber-500 text-white shadow"
+                    : "text-zinc-700 hover:bg-zinc-100 dark:text-zinc-200 dark:hover:bg-zinc-800"
+                }`}
+              >
+                Просмотр
+              </button>
+              <button
+                type="button"
+                onClick={() => setDiagramInteractionMode("edit")}
+                className={`rounded-md px-3 py-1.5 text-sm font-semibold transition-colors ${
+                  diagramInteractionMode === "edit"
+                    ? "bg-amber-500 text-white shadow"
+                    : "text-zinc-700 hover:bg-zinc-100 dark:text-zinc-200 dark:hover:bg-zinc-800"
+                }`}
+              >
+                Редактирование
+              </button>
+            </div>
+            {diagramInteractionMode === "edit" && (
+              <span className="max-w-md text-xs text-zinc-500 dark:text-zinc-400">
+                Перетаскивание узлов; в группе — только внутри рамки. Клик по узлу не меняет подграф.
+              </span>
+            )}
           </div>
-        )}
-        {!graphLoading && visibleGraphData.nodes.length === 0 && (
-          <div className="flex h-full items-center justify-center text-zinc-500 dark:text-zinc-400">
-            Диаграмма пуста
+          <div
+            className="flex flex-wrap items-center justify-center gap-1"
+            role="toolbar"
+            aria-label="Масштаб и экспорт диаграммы"
+          >
+            <button
+              type="button"
+              onClick={() => graphRef.current?.zoomIn()}
+              className="rounded-md border border-zinc-300 p-2 text-zinc-700 hover:bg-zinc-100 dark:border-zinc-600 dark:text-zinc-200 dark:hover:bg-zinc-700/60"
+              title="Увеличить"
+              aria-label="Увеличить масштаб"
+            >
+              <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5} aria-hidden>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M21 21l-5.197-5.197m0 0A7.5 7.5 0 105.196 5.196a7.5 7.5 0 0010.607 10.607zM10.5 7.5v6m3-3h-6" />
+              </svg>
+            </button>
+            <button
+              type="button"
+              onClick={() => graphRef.current?.zoomOut()}
+              className="rounded-md border border-zinc-300 p-2 text-zinc-700 hover:bg-zinc-100 dark:border-zinc-600 dark:text-zinc-200 dark:hover:bg-zinc-700/60"
+              title="Уменьшить"
+              aria-label="Уменьшить масштаб"
+            >
+              <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5} aria-hidden>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M21 21l-5.197-5.197m0 0A7.5 7.5 0 105.196 5.196a7.5 7.5 0 0010.607 10.607zM13.5 10.5h-6" />
+              </svg>
+            </button>
+            <button
+              type="button"
+              onClick={() => graphRef.current?.fitToScreen()}
+              className="rounded-md border border-zinc-300 p-2 text-zinc-700 hover:bg-zinc-100 dark:border-zinc-600 dark:text-zinc-200 dark:hover:bg-zinc-700/60"
+              title="По размеру окна"
+              aria-label="Вписать диаграмму в экран"
+            >
+              <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5} aria-hidden>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M3.75 3.75v4.5m0-4.5h4.5m-4.5 0L9 9M3.75 20.25v-4.5m0 4.5h4.5m-4.5 0L9 15M20.25 3.75h-4.5m4.5 0v4.5m0-4.5L15 9m5.25 11.25v-4.5m0 4.5h-4.5m4.5 0L15 15" />
+              </svg>
+            </button>
+            <span className="mx-1 hidden h-6 w-px shrink-0 bg-zinc-300 sm:inline-block dark:bg-zinc-600" aria-hidden />
+            <div className="flex flex-wrap gap-1" role="group" aria-label="Экспорт диаграммы">
+              <button
+                type="button"
+                onClick={() => graphRef.current?.exportPng()}
+                className="rounded-md border border-zinc-300 p-2 text-zinc-700 hover:bg-zinc-100 dark:border-zinc-600 dark:text-zinc-200 dark:hover:bg-zinc-700/60"
+                title="Экспорт PNG"
+                aria-label="Экспорт диаграммы в PNG"
+              >
+                <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5} aria-hidden>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M2.25 15.75l5.159-5.159a2.25 2.25 0 013.182 0l5.159 5.159m-1.5-1.5l1.409-1.409a2.25 2.25 0 013.182 0l2.909 2.909m-18 3.75h16.5a1.5 1.5 0 001.5-1.5V6a1.5 1.5 0 00-1.5-1.5H3.75A1.5 1.5 0 002.25 6v12a1.5 1.5 0 001.5 1.5zm10.5-11.25h.008v.008h-.008V8.25zm.375 0a.375.375 0 11-.75 0 .375.375 0 01.75 0z" />
+                </svg>
+              </button>
+              <button
+                type="button"
+                onClick={() => graphRef.current?.exportSvg()}
+                className="rounded-md border border-zinc-300 p-2 text-zinc-700 hover:bg-zinc-100 dark:border-zinc-600 dark:text-zinc-200 dark:hover:bg-zinc-700/60"
+                title="Экспорт SVG"
+                aria-label="Экспорт диаграммы в SVG"
+              >
+                <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5} aria-hidden>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M17.25 6.75L22.5 12l-5.25 5.25m-10.5 0L1.5 12l5.25-5.25m7.5-3l-4.5 16.5" />
+                </svg>
+              </button>
+              <button
+                type="button"
+                onClick={() => graphRef.current?.exportJson()}
+                className="rounded-md border border-zinc-300 p-2 text-zinc-700 hover:bg-zinc-100 dark:border-zinc-600 dark:text-zinc-200 dark:hover:bg-zinc-700/60"
+                title="Экспорт JSON (узлы, рёбра, координаты)"
+                aria-label="Экспорт диаграммы в JSON"
+              >
+                <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5} aria-hidden>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5a3.375 3.375 0 00-3.375-3.375H8.25m0 12.75h7.5m-7.5 3H12M10.5 2.25H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 00-9-9z" />
+                </svg>
+              </button>
+              <button
+                type="button"
+                onClick={() => graphRef.current?.exportPlantUml()}
+                className="rounded-md border border-zinc-300 p-2 text-zinc-700 hover:bg-zinc-100 dark:border-zinc-600 dark:text-zinc-200 dark:hover:bg-zinc-700/60"
+                title="Экспорт PlantUML (component diagram)"
+                aria-label="Экспорт диаграммы в PlantUML"
+              >
+                <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" aria-hidden>
+                  <rect x="2.5" y="4" width="19" height="16" rx="2" stroke="currentColor" strokeWidth={1.5} />
+                  <text
+                    x="12"
+                    y="15.25"
+                    textAnchor="middle"
+                    fill="currentColor"
+                    stroke="none"
+                    fontSize="7"
+                    fontWeight={700}
+                    fontFamily="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace"
+                  >
+                    PUML
+                  </text>
+                </svg>
+              </button>
+            </div>
           </div>
-        )}
-        {!graphLoading && visibleGraphData.nodes.length > 0 && (
-          <GraphCanvas
-            ref={graphRef}
-            nodes={visibleGraphData.nodes}
-            edges={visibleGraphData.edges}
-            focusNodeId={selectedNode?.id ?? null}
-            selectedNodeId={selectedNode?.id ?? null}
-            tagCountByNodeId={tagCountByNodeId}
-            pinnedNodeIds={pinnedIdSet}
-            onPinToggle={handlePinToggle}
-            onNodeClick={(node) => void openNode(node as C4Node)}
-            loading={graphLoading}
-          />
-        )}
+        </div>
+        <div className="relative min-h-0 flex-1">
+          {graphLoading && (
+            <div className="flex h-full items-center justify-center text-zinc-500 dark:text-zinc-400">
+              Загрузка диаграммы...
+            </div>
+          )}
+          {!graphLoading && visibleGraphData.nodes.length === 0 && (
+            <div className="flex h-full items-center justify-center text-zinc-500 dark:text-zinc-400">
+              Диаграмма пуста
+            </div>
+          )}
+          {!graphLoading && visibleGraphData.nodes.length > 0 && (
+            <GraphCanvas
+              ref={graphRef}
+              nodes={visibleGraphData.nodes}
+              edges={visibleGraphData.edges}
+              focusNodeId={selectedNode?.id ?? null}
+              selectedNodeId={selectedNode?.id ?? null}
+              tagCountByNodeId={tagCountByNodeId}
+              pinnedNodeIds={pinnedIdSet}
+              onPinToggle={handlePinToggle}
+              onNodeClick={handleGraphNodeClick}
+              interactionMode={diagramInteractionMode}
+              initialLayout={diagramLayout}
+              onLayoutPersist={handleLayoutPersist}
+              loading={graphLoading}
+            />
+          )}
+        </div>
       </main>
 
       <aside className={`${rightCollapsed ? "w-12" : "w-96"} flex shrink-0 flex-col border-l border-zinc-200 bg-white p-2 dark:border-zinc-700 dark:bg-zinc-900`}>
@@ -879,7 +1090,10 @@ export default function ProductArchMapTab({
           {selectedNode && (
             <button
               type="button"
-              onClick={() => setSelectedNode(null)}
+              onClick={() => {
+                setSelectedNode(null);
+                setDiagramLayout(null);
+              }}
               className="rounded px-2 py-1 text-xs text-zinc-500 hover:bg-zinc-100 dark:hover:bg-zinc-800"
             >
               Очистить
@@ -895,7 +1109,7 @@ export default function ProductArchMapTab({
           <div className="min-h-0 flex-1 overflow-auto rounded-md border border-zinc-200 dark:border-zinc-700">
             <div className="border-b border-zinc-200 px-3 py-2 dark:border-zinc-700">
               <div className="whitespace-pre-line font-medium text-zinc-900 dark:text-zinc-100">
-                {selectedNode.name.replace(/~/g, '\n')}
+                {nodeDisplayName(selectedNode as ArchNode).replace(/~/g, "\n")}
               </div>
               <div className="text-xs text-zinc-500 dark:text-zinc-400">{selectedNode.labels.join(", ")}</div>
             </div>

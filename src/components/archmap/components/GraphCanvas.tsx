@@ -11,6 +11,7 @@ import type { Simulation } from 'd3-force';
 import {
   graphEdgeLabel,
   isStructuralEdgeRelationship,
+  nodeDisplayName,
   type C4Node,
   type GraphEdge,
 } from '../types/c4';
@@ -30,6 +31,8 @@ import { buildPlantUmlComponentDiagram } from '../lib/graphExportPlantUml';
 import { computeDiagramBounds } from '../lib/graphDiagramBounds';
 import { getDiagramPalette, type DiagramPalette } from '../lib/diagramTheme';
 import { useTheme } from '@/components/ThemeProvider';
+import type { DiagramLayoutPersist } from '../types/diagramLayout';
+import { clusterMemberOffsetKey } from '../types/diagramLayout';
 
 interface GraphCanvasProps {
   nodes: C4Node[];
@@ -44,6 +47,12 @@ interface GraphCanvasProps {
   /** Переключатель прикрепления в углу карточки; если не задан — не рисуется. */
   onPinToggle?: (node: C4Node, pinned: boolean) => void;
   onNodeClick: (node: C4Node) => void;
+  /** Просмотр: клик ведёт навигацию (родитель). Редактирование: только выбор, без смены подграфа. */
+  interactionMode?: 'view' | 'edit';
+  /** Сохранённая раскладка для текущего контекста диаграммы. */
+  initialLayout?: DiagramLayoutPersist | null;
+  /** Вызывается после перетаскивания узла или мини-карточки в группе. */
+  onLayoutPersist?: (layout: DiagramLayoutPersist) => void;
   emptyHint?: string;
   loading?: boolean;
 }
@@ -396,7 +405,7 @@ function collapseDenseSimilarNodes(
         __clusterType: g.memberType,
         __clusterSize: members.length,
         __clusterEdgeLabel: g.edgeLabel === '(no-label)' ? '' : g.edgeLabel,
-        __clusterMemberNames: members.map((m) => m.name).join(', '),
+        __clusterMemberNames: members.map((m) => nodeDisplayName(m)).join(', '),
         __clusterWidth: dim.width,
         __clusterHeight: dim.height,
       },
@@ -448,23 +457,87 @@ function collapseDenseSimilarNodes(
   };
 }
 
+function clusterMemberSlotRect(
+  ln: LayoutNode,
+  memberIdx: number,
+  memberCount: number
+): { mx: number; my: number } {
+  const cols = Math.ceil(Math.sqrt(memberCount));
+  const col = memberIdx % cols;
+  const row = Math.floor(memberIdx / cols);
+  const innerStartX = ln.x + CLUSTER_BOX_PADDING;
+  const innerStartY = ln.y + CLUSTER_BOX_PADDING + CLUSTER_HEADER_H;
+  return {
+    mx: innerStartX + col * (CLUSTER_MEMBER_W + GRID_CELL),
+    my: innerStartY + row * (CLUSTER_MEMBER_H + GRID_CELL),
+  };
+}
+
 function hitTestClusterMember(
   ln: LayoutNode,
   clusterMeta: ClusterMeta,
   x: number,
-  y: number
+  y: number,
+  memberOffsetsRecord?: Record<string, { dx: number; dy: number }> | null
 ): C4Node | null {
-  const cols = Math.ceil(Math.sqrt(clusterMeta.members.length));
-  const innerStartX = ln.x + CLUSTER_BOX_PADDING;
-  const innerStartY = ln.y + CLUSTER_BOX_PADDING + CLUSTER_HEADER_H;
-  for (let idx = 0; idx < clusterMeta.members.length; idx++) {
-    const col = idx % cols;
-    const row = Math.floor(idx / cols);
-    const mx = innerStartX + col * (CLUSTER_MEMBER_W + GRID_CELL);
-    const my = innerStartY + row * (CLUSTER_MEMBER_H + GRID_CELL);
+  const clusterId = ln.node.id;
+  for (let idx = clusterMeta.members.length - 1; idx >= 0; idx--) {
+    const member = clusterMeta.members[idx]!;
+    const key = clusterMemberOffsetKey(clusterId, member.id);
+    const off = memberOffsetsRecord?.[key] ?? { dx: 0, dy: 0 };
+    const slot = clusterMemberSlotRect(ln, idx, clusterMeta.members.length);
+    const mx = slot.mx + off.dx;
+    const my = slot.my + off.dy;
     if (x >= mx && x <= mx + CLUSTER_MEMBER_W && y >= my && y <= my + CLUSTER_MEMBER_H) {
-      return clusterMeta.members[idx] ?? null;
+      return member;
     }
+  }
+  return null;
+}
+
+function clampMemberOffset(
+  ln: LayoutNode,
+  clusterMeta: ClusterMeta,
+  memberIdx: number,
+  dx: number,
+  dy: number
+): { dx: number; dy: number } {
+  const slot = clusterMemberSlotRect(ln, memberIdx, clusterMeta.members.length);
+  const innerLeft = ln.x + CLUSTER_BOX_PADDING;
+  const innerTop = ln.y + CLUSTER_BOX_PADDING + CLUSTER_HEADER_H;
+  const innerRight = ln.x + ln.width - CLUSTER_BOX_PADDING - CLUSTER_MEMBER_W;
+  const innerBottom = ln.y + ln.height - CLUSTER_BOX_PADDING - CLUSTER_MEMBER_H;
+  let mx = slot.mx + dx;
+  let my = slot.my + dy;
+  mx = Math.max(innerLeft, Math.min(mx, innerRight));
+  my = Math.max(innerTop, Math.min(my, innerBottom));
+  return { dx: mx - slot.mx, dy: my - slot.my };
+}
+
+type EditHit =
+  | { kind: 'member'; clusterId: string; member: C4Node; memberIdx: number }
+  | { kind: 'node'; nodeId: string };
+
+function hitTestEditDrag(
+  layout: LayoutNode[],
+  clusterMetaById: ReadonlyMap<string, ClusterMeta>,
+  x: number,
+  y: number,
+  memberOffsetsRecord: Record<string, { dx: number; dy: number }>
+): EditHit | null {
+  for (let i = layout.length - 1; i >= 0; i--) {
+    const ln = layout[i]!;
+    if (x < ln.x || x > ln.x + ln.width || y < ln.y || y > ln.y + ln.height) continue;
+    const cm = clusterMetaById.get(ln.node.id);
+    if (cm && isClusterNode(ln.node)) {
+      const member = hitTestClusterMember(ln, cm, x, y, memberOffsetsRecord);
+      if (member) {
+        const idx = cm.members.findIndex((m) => m.id === member.id);
+        if (idx >= 0) return { kind: 'member', clusterId: ln.node.id, member, memberIdx: idx };
+      }
+      return { kind: 'node', nodeId: ln.node.id };
+    }
+    return { kind: 'node', nodeId: ln.node.id };
   }
   return null;
 }
@@ -739,22 +812,22 @@ function paintClusterInnerMiniCards(
   ctx: CanvasRenderingContext2D,
   layout: LayoutNode[],
   clusterMetaById: ReadonlyMap<string, ClusterMeta>,
-  palette: DiagramPalette
+  palette: DiagramPalette,
+  memberOffsetsRecord?: Record<string, { dx: number; dy: number }> | null
 ): void {
   layout.forEach((ln) => {
     const clusterMeta = clusterMetaById.get(ln.node.id);
     if (!clusterMeta || !isClusterNode(ln.node)) return;
     const mainLabel = getMainLabel(ln.node.labels);
     const color = C4_COLORS[mainLabel] || '#777';
-    const cols = Math.ceil(Math.sqrt(clusterMeta.members.length));
-    const innerStartX = ln.x + CLUSTER_BOX_PADDING;
-    const innerStartY = ln.y + CLUSTER_BOX_PADDING + CLUSTER_HEADER_H;
+    const clusterId = ln.node.id;
     ctx.save();
     clusterMeta.members.forEach((member, idx) => {
-      const col = idx % cols;
-      const row = Math.floor(idx / cols);
-      const mx = innerStartX + col * (CLUSTER_MEMBER_W + GRID_CELL);
-      const my = innerStartY + row * (CLUSTER_MEMBER_H + GRID_CELL);
+      const slot = clusterMemberSlotRect(ln, idx, clusterMeta.members.length);
+      const key = clusterMemberOffsetKey(clusterId, member.id);
+      const off = memberOffsetsRecord?.[key] ?? { dx: 0, dy: 0 };
+      const mx = slot.mx + off.dx;
+      const my = slot.my + off.dy;
       ctx.fillStyle = palette.clusterInnerFill;
       ctx.strokeStyle = palette.clusterInnerBorder;
       ctx.lineWidth = 1;
@@ -763,8 +836,8 @@ function paintClusterInnerMiniCards(
       ctx.fillStyle = color;
       ctx.font = '10px "JetBrains Mono", monospace';
       ctx.textAlign = 'left';
-      const shortName =
-        member.name.length > 14 ? `${member.name.slice(0, 12)}...` : member.name;
+      const dn = nodeDisplayName(member);
+      const shortName = dn.length > 14 ? `${dn.slice(0, 12)}...` : dn;
       ctx.fillText(shortName, mx + 8, my + 22);
     });
     ctx.restore();
@@ -849,8 +922,8 @@ function paintDiagramNodes(
 
     ctx.font = '12px "JetBrains Mono", monospace';
     ctx.fillStyle = palette.textPrimary;
-    const name =
-      ln.node.name.length > 22 ? ln.node.name.slice(0, 20) + '...' : ln.node.name;
+    const display = nodeDisplayName(ln.node);
+    const name = display.length > 22 ? display.slice(0, 20) + '...' : display;
     ctx.fillText(name, ln.x + 12, ln.y + 38);
 
     if (ln.node.technology) {
@@ -972,6 +1045,9 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
     pinnedNodeIds,
     onPinToggle,
     onNodeClick,
+    interactionMode = 'view',
+    initialLayout = null,
+    onLayoutPersist,
     emptyHint,
     loading,
   },
@@ -988,6 +1064,25 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
   pinnedNodeIdsRef.current = pinnedNodeIds;
   const onPinToggleRef = useRef(onPinToggle);
   onPinToggleRef.current = onPinToggle;
+  const interactionModeRef = useRef(interactionMode);
+  interactionModeRef.current = interactionMode;
+  const initialLayoutRef = useRef(initialLayout);
+  initialLayoutRef.current = initialLayout;
+  const onLayoutPersistRef = useRef(onLayoutPersist);
+  onLayoutPersistRef.current = onLayoutPersist;
+  const clusterMemberOffsetsRef = useRef<Record<string, { dx: number; dy: number }>>({});
+  const editDragRef = useRef<{
+    type: 'node' | 'member';
+    nodeId: string;
+    clusterId?: string;
+    memberId?: string;
+    memberIdx?: number;
+    startClientX: number;
+    startClientY: number;
+    lastClientX: number;
+    lastClientY: number;
+  } | null>(null);
+  const suppressClickRef = useRef(false);
   const collapsedGraph = useMemo(
     () => collapseDenseSimilarNodes(nodes, edges, selectedNodeId, pinnedNodeIds),
     [nodes, edges, selectedNodeId, pinnedNodeIds]
@@ -1006,6 +1101,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
   const panRef = useRef({ x: 0, y: 0 });
   const zoomRef = useRef(1);
   const hasInitialFitRef = useRef(false);
+  const prevGraphKeyRef = useRef<string | null>(null);
   const layoutVersionRef = useRef(0);
   const geometryCacheRef = useRef<GeometryCache | null>(null);
   const fastModeRef = useRef(false);
@@ -1030,6 +1126,30 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
       }),
     [visibleNodes, visibleEdges]
   );
+
+  /** Сериализованная раскладка: при смене initialLayout без смены графа нужно перезапустить симуляцию. */
+  const layoutPersistKey = useMemo(
+    () => (initialLayout ? JSON.stringify(initialLayout) : ''),
+    [initialLayout]
+  );
+
+  useEffect(() => {
+    clusterMemberOffsetsRef.current = { ...(initialLayout?.clusterMemberOffsets ?? {}) };
+  }, [graphKey, initialLayout]);
+
+  const emitLayoutPersist = useCallback(() => {
+    const cb = onLayoutPersistRef.current;
+    if (!cb) return;
+    const positions: Record<string, { x: number; y: number }> = {};
+    for (const sn of simNodesRef.current) {
+      positions[sn.id] = { x: sn.x ?? 0, y: sn.y ?? 0 };
+    }
+    cb({
+      nodePositions: positions,
+      clusterMemberOffsets: { ...clusterMemberOffsetsRef.current },
+    });
+  }, []);
+
   const selectedNodeMapRef = useRef(new Map(visibleNodes.map((n) => [n.id, n])));
   selectedNodeMapRef.current = new Map(visibleNodes.map((n) => [n.id, n]));
 
@@ -1167,7 +1287,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
     if (!heavyModeRef.current) {
       placedLabels.forEach((g) => drawEdgeLabelPill(ctx, g, palette));
     }
-    paintClusterInnerMiniCards(ctx, layout, clusterMetaRef.current, palette);
+    paintClusterInnerMiniCards(ctx, layout, clusterMetaRef.current, palette, clusterMemberOffsetsRef.current);
 
     ctx.restore();
   }, [visibleEdges, simToLayout, focusNodeId, palette, pinnedNodeIds]);
@@ -1177,7 +1297,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
 
   useEffect(() => {
     drawRef.current();
-  }, [palette, pinnedNodeIds]);
+  }, [palette, pinnedNodeIds, interactionMode]);
 
   useImperativeHandle(
     ref,
@@ -1209,11 +1329,11 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
           tagCountRef.current,
           clusterMetaRef.current,
           palette,
-          pinnedNodeIdsRef.current
+          undefined
         );
         paintDiagramEdges(ctx, edgePolylines, { edgeDotted, palette });
         placedLabels.forEach((g) => drawEdgeLabelPill(ctx, g, palette));
-        paintClusterInnerMiniCards(ctx, layout, clusterMetaRef.current, palette);
+        paintClusterInnerMiniCards(ctx, layout, clusterMetaRef.current, palette, clusterMemberOffsetsRef.current);
         ctx.restore();
 
         const a = document.createElement('a');
@@ -1233,7 +1353,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
           width: ln.width,
           height: ln.height,
           id: ln.node.id,
-          name: ln.node.name,
+          name: nodeDisplayName(ln.node),
           technology: ln.node.technology,
           labels: ln.node.labels,
         }));
@@ -1248,7 +1368,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
           clustersExport[id] = {
             memberType: meta.memberType,
             edgeLabel: meta.edgeLabel,
-            members: meta.members.map((m) => ({ name: m.name })),
+            members: meta.members.map((m) => ({ name: nodeDisplayName(m), id: m.id })),
           };
         });
 
@@ -1270,6 +1390,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
           tagCounts,
           palette,
           clusters: clustersExport,
+          clusterMemberOffsets: clusterMemberOffsetsRef.current,
         });
         const blob = new Blob([svg], { type: 'image/svg+xml;charset=utf-8' });
         const url = URL.createObjectURL(blob);
@@ -1297,7 +1418,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
           selectedNodeId: selectedIdRef.current,
           nodes: layout.map((ln) => ({
             id: ln.node.id,
-            name: ln.node.name,
+            name: nodeDisplayName(ln.node),
             labels: ln.node.labels,
             technology: ln.node.technology,
             description: ln.node.description,
@@ -1319,6 +1440,12 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
             y: g.y,
             align: g.align,
           })),
+          savedLayout: {
+            nodePositions: Object.fromEntries(
+              simNodesRef.current.map((sn) => [sn.id, { x: sn.x ?? 0, y: sn.y ?? 0 }])
+            ),
+            clusterMemberOffsets: { ...clusterMemberOffsetsRef.current },
+          },
         };
         const blob = new Blob([JSON.stringify(payload, null, 2)], {
           type: 'application/json;charset=utf-8',
@@ -1375,8 +1502,16 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
     simulationRef.current?.stop();
     simulationRef.current = null;
     simNodesRef.current = [];
-    panRef.current = { x: 0, y: 0 };
-    zoomRef.current = 1;
+    const graphChanged = prevGraphKeyRef.current !== graphKey;
+    prevGraphKeyRef.current = graphKey;
+    const preserveViewport = interactionMode === 'edit' && !graphChanged;
+    if (!preserveViewport) {
+      panRef.current = { x: 0, y: 0 };
+      zoomRef.current = 1;
+    }
+    if (graphChanged) {
+      hasInitialFitRef.current = false;
+    }
     layoutVersionRef.current = 0;
     geometryCacheRef.current = null;
     deferredFullGeometryReadyRef.current = false;
@@ -1420,6 +1555,22 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
     simNodesRef.current = simNodes;
     simulationRef.current = simulation;
 
+    const saved = initialLayoutRef.current?.nodePositions;
+    if (saved) {
+      let applied = false;
+      for (const sn of simNodes) {
+        const p = saved[sn.id];
+        if (p) {
+          sn.x = p.x;
+          sn.y = p.y;
+          sn.fx = p.x;
+          sn.fy = p.y;
+          applied = true;
+        }
+      }
+      if (applied) hasInitialFitRef.current = true;
+    }
+
     const tick = () => {
       if (heavyModeRef.current && simulation.alpha() < 0.055) {
         simulation.stop();
@@ -1432,15 +1583,20 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
     };
     const onEnd = () => {
       const canvas = canvasRef.current;
-      if (canvas && !hasInitialFitRef.current) {
-        fitToScreen();
-        hasInitialFitRef.current = true;
-      } else if (canvas && focusIdRef.current) {
-        const layout = simToLayout(simNodesRef.current);
-        const p = computePanToCenterFocus(canvas, layout, focusIdRef.current, zoomRef.current);
-        if (p) {
-          panRef.current = p;
+      const edit = interactionModeRef.current === 'edit';
+      if (canvas && !edit) {
+        if (!hasInitialFitRef.current) {
+          fitToScreen();
+          hasInitialFitRef.current = true;
+        } else if (focusIdRef.current) {
+          const layout = simToLayout(simNodesRef.current);
+          const p = computePanToCenterFocus(canvas, layout, focusIdRef.current, zoomRef.current);
+          if (p) {
+            panRef.current = p;
+          }
         }
+      } else if (canvas && edit && !hasInitialFitRef.current) {
+        hasInitialFitRef.current = true;
       }
       drawRef.current();
     };
@@ -1580,7 +1736,17 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
       }
       simulation.stop();
     };
-  }, [fitToScreen, graphKey, resizeTick, simToLayout, selectedVisibleId, visibleEdges, visibleNodes]);
+  }, [
+    fitToScreen,
+    graphKey,
+    interactionMode,
+    layoutPersistKey,
+    resizeTick,
+    simToLayout,
+    selectedVisibleId,
+    visibleEdges,
+    visibleNodes,
+  ]);
 
   useEffect(() => {
     drawRef.current();
@@ -1599,21 +1765,101 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
         return;
       }
     }
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    const wx = (e.clientX - rect.left - panRef.current.x) / zoomRef.current;
+    const wy = (e.clientY - rect.top - panRef.current.y) / zoomRef.current;
+
+    if (interactionModeRef.current === 'edit') {
+      const eh = hitTestEditDrag(
+        layoutRef.current,
+        clusterMetaRef.current,
+        wx,
+        wy,
+        clusterMemberOffsetsRef.current
+      );
+      if (eh) {
+        suppressClickRef.current = false;
+        if (eh.kind === 'member') {
+          editDragRef.current = {
+            type: 'member',
+            nodeId: eh.clusterId,
+            clusterId: eh.clusterId,
+            memberId: eh.member.id,
+            memberIdx: eh.memberIdx,
+            startClientX: e.clientX,
+            startClientY: e.clientY,
+            lastClientX: e.clientX,
+            lastClientY: e.clientY,
+          };
+        } else {
+          editDragRef.current = {
+            type: 'node',
+            nodeId: eh.nodeId,
+            startClientX: e.clientX,
+            startClientY: e.clientY,
+            lastClientX: e.clientX,
+            lastClientY: e.clientY,
+          };
+        }
+        dragRef.current.dragging = false;
+        canvas.style.cursor = 'move';
+        return;
+      }
+    }
+
     dragRef.current = { dragging: true, lastX: e.clientX, lastY: e.clientY };
-    if (canvas) canvas.style.cursor = 'grabbing';
+    canvas.style.cursor = 'grabbing';
   };
 
   const handleMouseMove = (e: React.MouseEvent) => {
     const canvas = canvasRef.current;
     if (!canvas) return;
+    const ed = editDragRef.current;
+    if (ed) {
+      const z = zoomRef.current;
+      const dx = (e.clientX - ed.lastClientX) / z;
+      const dy = (e.clientY - ed.lastClientY) / z;
+      ed.lastClientX = e.clientX;
+      ed.lastClientY = e.clientY;
+
+      if (ed.type === 'node') {
+        const sn = simNodesRef.current.find((s) => s.id === ed.nodeId);
+        if (sn) {
+          sn.x = (sn.x ?? 0) + dx;
+          sn.y = (sn.y ?? 0) + dy;
+          sn.fx = sn.x;
+          sn.fy = sn.y;
+        }
+      } else if (ed.clusterId && ed.memberId != null && ed.memberIdx !== undefined) {
+        const ln = layoutRef.current.find((l) => l.node.id === ed.clusterId);
+        const cm = clusterMetaRef.current.get(ed.clusterId);
+        if (ln && cm) {
+          const key = clusterMemberOffsetKey(ed.clusterId, ed.memberId);
+          const prev = clusterMemberOffsetsRef.current[key] ?? { dx: 0, dy: 0 };
+          clusterMemberOffsetsRef.current[key] = clampMemberOffset(
+            ln,
+            cm,
+            ed.memberIdx,
+            prev.dx + dx,
+            prev.dy + dy
+          );
+        }
+      }
+      layoutVersionRef.current += 1;
+      geometryCacheRef.current = null;
+      drawRef.current();
+      return;
+    }
+
     if (!dragRef.current.dragging) {
       handleMouseHover(e);
       return;
     }
-    const dx = e.clientX - dragRef.current.lastX;
-    const dy = e.clientY - dragRef.current.lastY;
-    panRef.current.x += dx;
-    panRef.current.y += dy;
+    const panDx = e.clientX - dragRef.current.lastX;
+    const panDy = e.clientY - dragRef.current.lastY;
+    panRef.current.x += panDx;
+    panRef.current.y += panDy;
     dragRef.current.lastX = e.clientX;
     dragRef.current.lastY = e.clientY;
     drawRef.current();
@@ -1641,10 +1887,19 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
     drawRef.current();
   };
 
-  const handleMouseUp = () => {
-    dragRef.current.dragging = false;
+  const handleMouseUp = (e: React.MouseEvent) => {
     const canvas = canvasRef.current;
-    if (canvas) canvas.style.cursor = 'grab';
+    const ed = editDragRef.current;
+    if (ed) {
+      const moved = Math.hypot(e.clientX - ed.startClientX, e.clientY - ed.startClientY);
+      if (moved > 6) suppressClickRef.current = true;
+      editDragRef.current = null;
+      if (onLayoutPersistRef.current) emitLayoutPersist();
+    }
+    dragRef.current.dragging = false;
+    if (canvas) {
+      canvas.style.cursor = 'grab';
+    }
   };
 
   const handleMouseHover = (e: React.MouseEvent) => {
@@ -1653,6 +1908,21 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
     const rect = canvas.getBoundingClientRect();
     const x = (e.clientX - rect.left - panRef.current.x) / zoomRef.current;
     const y = (e.clientY - rect.top - panRef.current.y) / zoomRef.current;
+
+    if (interactionModeRef.current === 'edit') {
+      const eh = hitTestEditDrag(
+        layoutRef.current,
+        clusterMetaRef.current,
+        x,
+        y,
+        clusterMemberOffsetsRef.current
+      );
+      if (eh) {
+        canvas.style.cursor = 'move';
+        return;
+      }
+    }
+
     const hovered = layoutRef.current.find(
       (ln) => x >= ln.x && x <= ln.x + ln.width && y >= ln.y && y <= ln.y + ln.height
     );
@@ -1673,14 +1943,18 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
       return;
     }
     const cm = clusterMetaRef.current.get(hovered.node.id);
-    if (cm && hitTestClusterMember(hovered, cm, x, y)) {
-      canvas.style.cursor = 'pointer';
+    if (cm && hitTestClusterMember(hovered, cm, x, y, clusterMemberOffsetsRef.current)) {
+      canvas.style.cursor = interactionModeRef.current === 'edit' ? 'move' : 'pointer';
       return;
     }
     canvas.style.cursor = 'grab';
   };
 
   const handleClick = (e: React.MouseEvent) => {
+    if (suppressClickRef.current) {
+      suppressClickRef.current = false;
+      return;
+    }
     const canvas = canvasRef.current;
     if (!canvas) return;
     const rect = canvas.getBoundingClientRect();
@@ -1701,11 +1975,11 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
         onPinToggleRef.current(clicked.node, !pinned);
         return;
       }
-      // Клик по "объединяющему" пунктирному прямоугольнику (cluster) игнорируем.
-      // Drilldown должен происходить только по исходным узлам, не по агрегатам.
       if (isClusterNode(clicked.node)) {
         const cm = clusterMetaRef.current.get(clicked.node.id);
-        const member = cm ? hitTestClusterMember(clicked, cm, x, y) : null;
+        const member = cm
+          ? hitTestClusterMember(clicked, cm, x, y, clusterMemberOffsetsRef.current)
+          : null;
         if (member) onNodeClick(member);
         return;
       }
@@ -1724,7 +1998,13 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
         onMouseOver={handleMouseHover}
         onMouseEnter={handleMouseHover}
         onMouseUp={handleMouseUp}
-        onMouseLeave={handleMouseUp}
+        onMouseLeave={() => {
+          if (editDragRef.current && onLayoutPersistRef.current) emitLayoutPersist();
+          dragRef.current.dragging = false;
+          editDragRef.current = null;
+          const c = canvasRef.current;
+          if (c) c.style.cursor = 'grab';
+        }}
         onWheel={handleWheel}
       />
       {visibleNodes.length === 0 && (

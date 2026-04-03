@@ -1,5 +1,5 @@
 import type { C4Node, GraphEdge } from '../types/c4';
-import { graphEdgeLabel, isStructuralEdgeRelationship } from '../types/c4';
+import { graphEdgeLabel, isStructuralEdgeRelationship, nodeDisplayName } from '../types/c4';
 
 const KNOWN_LABELS = [
   'SoftwareSystem',
@@ -59,7 +59,7 @@ function clusterPlantUmlTitle(n: C4Node): string {
   const list =
     typeof p.__clusterMemberNames === 'string' && p.__clusterMemberNames.trim()
       ? p.__clusterMemberNames.trim()
-      : n.name;
+      : nodeDisplayName(n);
   return `Группа: ${list}`;
 }
 
@@ -78,7 +78,7 @@ export function buildPlantUmlComponentDiagram(nodes: C4Node[], edges: GraphEdge[
   for (const n of nodes) {
     const alias = aliasMap.get(n.id)!;
     const ml = mainLabel(n.labels);
-    const title = escapeQuoted(isClusterNode(n) ? clusterPlantUmlTitle(n) : n.name);
+    const title = escapeQuoted(isClusterNode(n) ? clusterPlantUmlTitle(n) : nodeDisplayName(n));
     lines.push(`component "${title}" <<${ml}>> as ${alias}`);
   }
   lines.push('');
